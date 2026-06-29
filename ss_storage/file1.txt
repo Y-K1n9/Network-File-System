@@ -1,0 +1,2 @@
+hello from storage server
+this is a sample file
