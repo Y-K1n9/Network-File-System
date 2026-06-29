@@ -6,6 +6,39 @@
 #include <string.h>
 #include <unistd.h>
 
+static int register_client(const char *username) {
+    int sockfd = connect_to_server("127.0.0.1", NM_PORT);
+    if (sockfd < 0) {
+        perror("[Client] connect_to_server register");
+        return -1;
+    }
+
+    ClientRegisterPacket req;
+    req.command_type = CMD_CLIENT_REGISTER;
+    snprintf(req.username, sizeof(req.username), "%s", username);
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    ClientRegisterResponse resp;
+    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    close(sockfd);
+
+    if (resp.status != 0) {
+        printf("[Client] Handshake Failed: %s\n", resp.message);
+        return -1;
+    }
+
+    printf("[Client] Handshake Success: %s\n", resp.message);
+    return 0;
+}
+
 static int lookup_file(const char *username, const char *filename, char *ss_ip, int *ss_port) {
     int sockfd = connect_to_server("127.0.0.1", NM_PORT);
     if (sockfd < 0) {
@@ -14,17 +47,11 @@ static int lookup_file(const char *username, const char *filename, char *ss_ip, 
     }
 
     LookupRequestPacket req;
-    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_CLIENT_LOOKUP;
     snprintf(req.username, sizeof(req.username), "%s", username);
     snprintf(req.filename, sizeof(req.filename), "%s", filename);
 
-    if (send_packet_type(sockfd, PKT_CLIENT_LOOKUP) < 0 || send_struct(sockfd, &req, sizeof(req)) < 0) {
-        close(sockfd);
-        return -1;
-    }
-
-    unsigned int type = 0;
-    if (recv_packet_type(sockfd, &type) < 0 || type != PKT_LOOKUP_RESPONSE) {
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
         close(sockfd);
         return -1;
     }
@@ -38,7 +65,11 @@ static int lookup_file(const char *username, const char *filename, char *ss_ip, 
     close(sockfd);
 
     if (resp.status != 0) {
-        printf("%s\n", resp.message);
+        if (resp.status == ERR_FILE_UNAVAILABLE) {
+            printf("[Client] NM response error: All storage server replicas for '%s' are offline.\n", filename);
+        } else {
+            printf("[Client] NM response error: %s\n", resp.message);
+        }
         return -1;
     }
 
@@ -56,17 +87,11 @@ static int read_file_from_ss(const char *ss_ip, int ss_port, const char *usernam
     }
 
     ReadRequestPacket req;
-    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_FILE_READ;
     snprintf(req.username, sizeof(req.username), "%s", username);
     snprintf(req.filename, sizeof(req.filename), "%s", filename);
 
-    if (send_packet_type(sockfd, PKT_SS_READ_REQUEST) < 0 || send_struct(sockfd, &req, sizeof(req)) < 0) {
-        close(sockfd);
-        return -1;
-    }
-
-    unsigned int type = 0;
-    if (recv_packet_type(sockfd, &type) < 0 || type != PKT_SS_READ_RESPONSE) {
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
         close(sockfd);
         return -1;
     }
@@ -111,6 +136,12 @@ int main(void) {
     fflush(stdout);
     if (!fgets(username, sizeof(username), stdin)) return 1;
     trim_newline(username);
+
+    // Force CMD_CLIENT_REGISTER handshake on startup
+    if (register_client(username) < 0) {
+        printf("[Client] Exiting due to registration failure.\n");
+        return 1;
+    }
 
     printf("File to read: ");
     fflush(stdout);

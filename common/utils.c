@@ -1,7 +1,6 @@
 #include "utils.h"
 
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,36 +31,12 @@ int recv_all(int sockfd, void *buf, size_t len) {
     return 0;
 }
 
-int send_packet_type(int sockfd, unsigned int type) {
-    uint32_t net = htonl(type);
-    return send_all(sockfd, &net, sizeof(net));
-}
-
-int recv_packet_type(int sockfd, unsigned int *type) {
-    uint32_t net = 0;
-    if (recv_all(sockfd, &net, sizeof(net)) < 0) return -1;
-    *type = ntohl(net);
-    return 0;
-}
-
 int send_struct(int sockfd, const void *data, size_t len) {
     return send_all(sockfd, data, len);
 }
 
 int recv_struct(int sockfd, void *data, size_t len) {
     return recv_all(sockfd, data, len);
-}
-
-int send_int32(int sockfd, int value) {
-    int32_t net = htonl(value);
-    return send_all(sockfd, &net, sizeof(net));
-}
-
-int recv_int32(int sockfd, int *value) {
-    int32_t net = 0;
-    if (recv_all(sockfd, &net, sizeof(net)) < 0) return -1;
-    *value = ntohl(net);
-    return 0;
 }
 
 int create_server_socket(int port) {
@@ -110,25 +85,6 @@ int connect_to_server(const char *ip, int port) {
     return sockfd;
 }
 
-ssize_t recv_line(int sockfd, char *buf, size_t maxlen) {
-    if (maxlen == 0) return -1;
-    size_t i = 0;
-    while (i < maxlen - 1) {
-        char c;
-        ssize_t n = recv(sockfd, &c, 1, 0);
-        if (n == 1) {
-            buf[i++] = c;
-            if (c == '\n') break;
-        } else if (n == 0) {
-            break;
-        } else {
-            return -1;
-        }
-    }
-    buf[i] = '\0';
-    return (ssize_t)i;
-}
-
 void trim_newline(char *s) {
     if (!s) return;
     size_t len = strlen(s);
@@ -136,9 +92,4 @@ void trim_newline(char *s) {
         s[len - 1] = '\0';
         len--;
     }
-}
-
-const char *safe_basename(const char *path) {
-    const char *last = strrchr(path, '/');
-    return last ? last + 1 : path;
 }

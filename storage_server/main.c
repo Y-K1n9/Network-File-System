@@ -17,54 +17,102 @@
 typedef struct {
     int client_fd;
     char storage_dir[MAX_PATH_LEN];
-} ReadConnection;
+} ClientConnection;
 
-static void *handle_read_request(void *arg) {
-    ReadConnection *conn = (ReadConnection *)arg;
-    int fd = conn->client_fd;
+typedef struct {
+    char nm_ip[MAX_IP_LEN];
+    int nm_heartbeat_port;
+    int client_port;
+} HeartbeatPingArgs;
 
-    unsigned int type = 0;
-    if (recv_packet_type(fd, &type) < 0 || type != PKT_SS_READ_REQUEST) {
-        close(fd);
-        free(conn);
-        return NULL;
-    }
+static int contains_path_traversal(const char *path) {
+    if (!path) return 0;
+    if (path[0] == '/') return 1;
+    if (strstr(path, "../") != NULL) return 1;
+    if (strstr(path, "/..") != NULL) return 1;
+    if (strcmp(path, "..") == 0) return 1;
+    return 0;
+}
 
-    ReadRequestPacket req;
-    if (recv_struct(fd, &req, sizeof(req)) < 0) {
-        close(fd);
-        free(conn);
-        return NULL;
+static void handle_file_read(int fd, const char *storage_dir, const char *filename) {
+    if (contains_path_traversal(filename)) {
+        printf("[SS] Secure Path Block: Blocked read request for path traversal: %s\n", filename);
+        ReadResponseHeader hdr = { .command_type = CMD_FILE_READ, .status = -1, .content_length = 0 };
+        send_struct(fd, &hdr, sizeof(hdr));
+        return;
     }
 
     char *buffer = NULL;
     long length = 0;
-    if (read_file_into_buffer(conn->storage_dir, req.filename, &buffer, &length) < 0) {
-        ReadResponseHeader hdr = { .status = -1, .content_length = 0 };
-        send_packet_type(fd, PKT_SS_READ_RESPONSE);
+    if (read_file_into_buffer(storage_dir, filename, &buffer, &length) < 0) {
+        ReadResponseHeader hdr = { .command_type = CMD_FILE_READ, .status = -1, .content_length = 0 };
         send_struct(fd, &hdr, sizeof(hdr));
         free(buffer);
+        return;
+    }
+
+    ReadResponseHeader hdr;
+    hdr.command_type = CMD_FILE_READ;
+    hdr.status = 0;
+    hdr.content_length = length;
+    send_struct(fd, &hdr, sizeof(hdr));
+    if (length > 0) send_all(fd, buffer, (size_t)length);
+    free(buffer);
+}
+
+static void *handle_client_connection(void *arg) {
+    ClientConnection *conn = (ClientConnection *)arg;
+    int fd = conn->client_fd;
+
+    int32_t cmd_type = 0;
+    if (recv_all(fd, &cmd_type, sizeof(cmd_type)) < 0) {
         close(fd);
         free(conn);
         return NULL;
     }
 
-    ReadResponseHeader hdr;
-    hdr.status = 0;
-    hdr.content_length = length;
-    send_packet_type(fd, PKT_SS_READ_RESPONSE);
-    send_struct(fd, &hdr, sizeof(hdr));
-    if (length > 0) send_all(fd, buffer, (size_t)length);
+    switch (cmd_type) {
+        case CMD_FILE_READ: {
+            ReadRequestPacket req;
+            req.command_type = cmd_type;
+            if (recv_struct(fd, ((char *)&req) + sizeof(int32_t), sizeof(req) - sizeof(int32_t)) == 0) {
+                handle_file_read(fd, conn->storage_dir, req.filename);
+            }
+            break;
+        }
+        default: {
+            int32_t status = -1;
+            send_all(fd, &status, sizeof(status));
+            break;
+        }
+    }
 
-    free(buffer);
     close(fd);
     free(conn);
+    return NULL;
+}
+
+static void *heartbeat_ping_thread(void *arg) {
+    HeartbeatPingArgs *args = (HeartbeatPingArgs *)arg;
+    while (1) {
+        int fd = connect_to_server(args->nm_ip, args->nm_heartbeat_port);
+        if (fd >= 0) {
+            HeartbeatPacket hb;
+            hb.command_type = CMD_HEARTBEAT;
+            hb.client_port = args->client_port;
+            send_struct(fd, &hb, sizeof(hb));
+            close(fd);
+        }
+        usleep(1500000); // 1.5 seconds
+    }
+    free(args);
     return NULL;
 }
 
 static int register_with_nm(const char *nm_ip, int nm_port, int client_port, const char *storage_dir) {
     SS_Registration_Packet packet;
     memset(&packet, 0, sizeof(packet));
+    packet.command_type = CMD_REGISTER_SS;
     strncpy(packet.ip, "127.0.0.1", sizeof(packet.ip) - 1);
     packet.nm_port = nm_port;
     packet.client_port = client_port;
@@ -80,7 +128,7 @@ static int register_with_nm(const char *nm_ip, int nm_port, int client_port, con
         return -1;
     }
 
-    if (send_packet_type(sockfd, PKT_SS_REGISTER) < 0 || send_struct(sockfd, &packet, sizeof(packet)) < 0) {
+    if (send_struct(sockfd, &packet, sizeof(packet)) < 0) {
         close(sockfd);
         return -1;
     }
@@ -105,13 +153,27 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Spawn heartbeat ping thread
+    HeartbeatPingArgs *hb_args = (HeartbeatPingArgs *)malloc(sizeof(HeartbeatPingArgs));
+    if (hb_args) {
+        strncpy(hb_args->nm_ip, nm_ip, sizeof(hb_args->nm_ip) - 1);
+        hb_args->nm_heartbeat_port = NM_HEARTBEAT_PORT;
+        hb_args->client_port = client_port;
+        pthread_t ping_tid;
+        if (pthread_create(&ping_tid, NULL, heartbeat_ping_thread, hb_args) == 0) {
+            pthread_detach(ping_tid);
+        } else {
+            free(hb_args);
+        }
+    }
+
     int server_fd = create_server_socket(client_port);
     if (server_fd < 0) {
         perror("[SS] create_server_socket");
         return 1;
     }
 
-    printf("[SS] Listening for direct reads on port %d\n", client_port);
+    printf("[SS] Listening for direct operations on port %d\n", client_port);
 
     while (1) {
         struct sockaddr_in client_addr;
@@ -122,7 +184,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        ReadConnection *conn = (ReadConnection *)calloc(1, sizeof(ReadConnection));
+        ClientConnection *conn = (ClientConnection *)calloc(1, sizeof(ClientConnection));
         if (!conn) {
             close(client_fd);
             continue;
@@ -131,7 +193,7 @@ int main(int argc, char *argv[]) {
         strncpy(conn->storage_dir, storage_dir, sizeof(conn->storage_dir) - 1);
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, handle_read_request, conn) == 0) {
+        if (pthread_create(&tid, NULL, handle_client_connection, conn) == 0) {
             pthread_detach(tid);
         } else {
             close(client_fd);

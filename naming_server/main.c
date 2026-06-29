@@ -24,49 +24,146 @@ static void *handle_connection(void *arg) {
     inet_ntop(AF_INET, &conn->addr.sin_addr, peer_ip, sizeof(peer_ip));
     free(conn);
 
-    unsigned int type = 0;
-    if (recv_packet_type(fd, &type) < 0) {
+    int32_t cmd_type = 0;
+    if (recv_all(fd, &cmd_type, sizeof(cmd_type)) < 0) {
         close(fd);
         return NULL;
     }
 
-    if (type == PKT_SS_REGISTER) {
+    if (cmd_type == CMD_REGISTER_SS) {
         SS_Registration_Packet packet;
-        if (recv_struct(fd, &packet, sizeof(packet)) == 0) {
-            registry_upsert(&packet);
-            printf("[NM] Received registration from SS at %s.\n", packet.ip);
-            printf("[NM] SS client port: %d, files: %d\n", packet.client_port, packet.file_count);
+        packet.command_type = cmd_type;
+        if (recv_struct(fd, ((char *)&packet) + sizeof(int32_t), sizeof(packet) - sizeof(int32_t)) == 0) {
+            StorageServer *ss = registry_register_ss(packet.ip, packet.nm_port, packet.client_port);
+            if (ss) {
+                for (int i = 0; i < packet.file_count; ++i) {
+                    registry_add_file(packet.filenames[i], ss);
+                }
+                printf("[NM] Received registration from SS at %s.\n", packet.ip);
+                printf("[NM] SS client port: %d, files: %d\n", packet.client_port, packet.file_count);
+            } else {
+                printf("[NM] SS registration failed for %s:%d\n", packet.ip, packet.client_port);
+            }
         }
-    } else if (type == PKT_CLIENT_LOOKUP) {
+    } else if (cmd_type == CMD_CLIENT_REGISTER) {
+        ClientRegisterPacket packet;
+        packet.command_type = cmd_type;
+        if (recv_struct(fd, ((char *)&packet) + sizeof(int32_t), sizeof(packet) - sizeof(int32_t)) == 0) {
+            int status = registry_register_client(packet.username, peer_ip);
+            ClientRegisterResponse resp;
+            resp.command_type = CMD_CLIENT_REGISTER_RESP;
+            resp.status = status;
+            if (status == 0) {
+                snprintf(resp.message, sizeof(resp.message), "Welcome %s! Registration successful.", packet.username);
+                printf("[NM] Client '%s' registered from %s\n", packet.username, peer_ip);
+            } else {
+                snprintf(resp.message, sizeof(resp.message), "Registration failed.");
+            }
+            send_struct(fd, &resp, sizeof(resp));
+        }
+    } else if (cmd_type == CMD_CLIENT_LOOKUP) {
         LookupRequestPacket req;
-        LookupResponsePacket resp;
-        memset(&resp, 0, sizeof(resp));
-        if (recv_struct(fd, &req, sizeof(req)) == 0) {
-            SS_Registration_Packet ss;
-            if (registry_find_file(req.filename, &ss)) {
-                resp.status = 0;
-                snprintf(resp.ip, sizeof(resp.ip), "%s", ss.ip);
-                resp.client_port = ss.client_port;
-                snprintf(resp.message, sizeof(resp.message), "File '%s' found on %s:%d", req.filename, ss.ip, ss.client_port);
-                printf("[NM] Lookup for '%s' by %s resolved to %s:%d\n", req.filename, req.username, ss.ip, ss.client_port);
+        req.command_type = cmd_type;
+        if (recv_struct(fd, ((char *)&req) + sizeof(int32_t), sizeof(req) - sizeof(int32_t)) == 0) {
+            if (!registry_is_client_registered(req.username)) {
+                printf("[NM] Unregistered client '%s' attempted lookup. Dropping connection.\n", req.username);
+                close(fd);
+                return NULL;
+            }
+
+            LookupResponsePacket resp;
+            memset(&resp, 0, sizeof(resp));
+            resp.command_type = CMD_LOOKUP_RESPONSE;
+
+            StorageServer *ss_list[MAX_REPLICAS];
+            int32_t ss_count = 0;
+            if (registry_find_file(req.filename, ss_list, &ss_count) && ss_count > 0) {
+                StorageServer *target_ss = NULL;
+                for (int i = 0; i < ss_count; ++i) {
+                    if (ss_list[i]->status == SS_STATUS_ONLINE) {
+                        target_ss = ss_list[i];
+                        break;
+                    }
+                }
+                if (target_ss) {
+                    resp.status = 0;
+                    snprintf(resp.ip, sizeof(resp.ip), "%s", target_ss->ip);
+                    resp.client_port = target_ss->client_port;
+                    snprintf(resp.message, sizeof(resp.message), "File '%s' found on %s:%d", req.filename, target_ss->ip, target_ss->client_port);
+                    printf("[NM] Lookup for '%s' by %s resolved to %s:%d\n", req.filename, req.username, target_ss->ip, target_ss->client_port);
+                } else {
+                    resp.status = ERR_FILE_UNAVAILABLE;
+                    snprintf(resp.message, sizeof(resp.message), "File '%s' exists but all replica storage servers are offline", req.filename);
+                    printf("[NM] Lookup failed for '%s' by %s: All replica servers offline\n", req.filename, req.username);
+                }
             } else {
                 resp.status = -1;
                 snprintf(resp.message, sizeof(resp.message), "File '%s' not found", req.filename);
                 printf("[NM] Lookup failed for '%s' by %s\n", req.filename, req.username);
             }
-            send_packet_type(fd, PKT_LOOKUP_RESPONSE);
             send_struct(fd, &resp, sizeof(resp));
         }
     } else {
-        printf("[NM] Unknown packet type %u from %s\n", type, peer_ip);
+        printf("[NM] Unknown command type %d from %s\n", cmd_type, peer_ip);
     }
 
     close(fd);
     return NULL;
 }
 
+static void *timeout_monitor_thread(void *arg) {
+    (void)arg;
+    while (1) {
+        sleep(2);
+        registry_check_timeouts(5); // timeout threshold: 5 seconds
+    }
+    return NULL;
+}
+
+static void *heartbeat_listener_thread(void *arg) {
+    (void)arg;
+    int server_fd = create_server_socket(NM_HEARTBEAT_PORT);
+    if (server_fd < 0) {
+        perror("[NM Heartbeat] Failed to create server socket on port 5001");
+        return NULL;
+    }
+    printf("[NM Heartbeat] Listening for heartbeats on port %d\n", NM_HEARTBEAT_PORT);
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_fd < 0) {
+            continue;
+        }
+
+        HeartbeatPacket hb;
+        if (recv_struct(client_fd, &hb, sizeof(hb)) == 0) {
+            if (hb.command_type == CMD_HEARTBEAT) {
+                registry_update_heartbeat(hb.client_port);
+            }
+        }
+        close(client_fd);
+    }
+    close(server_fd);
+    return NULL;
+}
+
 int main(void) {
     registry_init();
+
+    pthread_t monitor_tid, hb_tid;
+    if (pthread_create(&monitor_tid, NULL, timeout_monitor_thread, NULL) != 0) {
+        perror("[NM] Failed to spawn timeout monitor thread");
+        return 1;
+    }
+    pthread_detach(monitor_tid);
+
+    if (pthread_create(&hb_tid, NULL, heartbeat_listener_thread, NULL) != 0) {
+        perror("[NM] Failed to spawn heartbeat listener thread");
+        return 1;
+    }
+    pthread_detach(hb_tid);
 
     int server_fd = create_server_socket(NM_PORT);
     if (server_fd < 0) {
