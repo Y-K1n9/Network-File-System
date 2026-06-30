@@ -1,0 +1,26 @@
+# Docs++ — Distributed File System
+# Feature 1: CREATE | Feature 4: VIEW
+
+## Binaries
+nm_server
+ss_server
+nfs_client
+
+## Runtime files
+nm_files.json
+*.json
+
+## Storage directories (auto-created)
+ss_storage/
+ss_storage2/
+
+## Old flat-file stubs (superseded by subdirectory layout)
+common.h
+name_server.c
+storage_server.c
+client.c
+
+## Editor / OS noise
+.DS_Store
+*.swp
+*~
