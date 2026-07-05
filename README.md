@@ -83,6 +83,9 @@ mkdir -p ss_storage2 && echo "hello from ss2" > ss_storage2/file2.txt
 | `STREAM <filename>` | **READ** | Word-by-word content streaming with 0.1s delay |
 | `WRITE <filename> <sentence_num>` | **WRITE** | Edit a file at the word/sentence level |
 | `DELETE <filename>` | **DELETE**| Cascading deletion & NM tracking eviction (owner only) |
+| `ADDACCESS -R/-W <file> <user>` | **ACCESS**| Grant read or read/write access to a user |
+| `REMACCESS <file> <user>` | **ACCESS**| Revoke access from a user |
+| `INFO <filename>` | **INFO** | View file metadata and your current access level |
 | `LIST` | **Feature 3** | Show all currently connected/registered users |
 | `help` | — | Show command reference |
 | `exit` | — | Disconnect |
@@ -241,6 +244,41 @@ Consolidates all error codes into a single, standardized set returned consistent
 
 ---
 
+## Feature — Access Control (ADDACCESS & REMACCESS)
+
+- **Ownership-based Authorization**: The creator of a file automatically becomes its owner (with RW access). Only the owner can modify access permissions for other users.
+- **Dynamic Updates**: Permissions are instantly synchronized with the Naming Server and take effect immediately for connected clients.
+
+### Expected Output (Granting Access)
+```
+alice@docs++ > ADDACCESS -R report.txt bob
+✓ Access granted successfully!
+```
+
+### Expected Output (Verifying Access)
+```
+bob@docs++ > INFO report.txt
+
+─── report.txt ───────────────────────────────────
+  Owner:          alice
+  Size:           12 bytes
+  Words:          2
+  Characters:     11
+  Created:        2026-07-05 22:52
+  Last Modified:  2026-07-05 22:53
+  Last Accessed:  2026-07-05 22:53
+  Your Access:    R
+─────────────────────────────────────────────────
+```
+
+### Expected Output (Revoking Access)
+```
+alice@docs++ > REMACCESS report.txt bob
+✓ Access removed successfully!
+```
+
+---
+
 ## Architecture
 
 ```
@@ -304,4 +342,8 @@ Command IDs defined in `common/protocols.h`.
 - **Feature 3 (LIST Connected Users)**: Implemented `LIST` command in client REPL, querying Naming Server for the active registry of client names, IP addresses, and online statuses.
 - **Feature 5 (Universal Error Codes)**: Consolidated and standardized system-wide error definitions in `protocols.h`, mapping internal failure states to universal return codes.
 - **Code Refactor & Bug Fixes**: Removed unused variables (e.g. `storage_dir` context propagation to threads), cleaned block comments, and fixed a bug where `handle_ss_delete` in storage server failed to send an ACK packet back to the naming server.
+
+### 2026-07-05
+- **Access Control (`ADDACCESS`, `REMACCESS`)**: Added the ability for file owners to dynamically grant Read (`-R`), Read/Write (`-W`), or completely revoke access for other users. Integrated Access Control Lists (ACL) into the Naming Server registry.
+- **INFO Command Implementation**: Finished the missing implementation of `INFO` in the client CLI to display rich file metadata, including timestamps, sizes, and the current user's access level.
 ```
