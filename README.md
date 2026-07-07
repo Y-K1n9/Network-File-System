@@ -3,7 +3,7 @@
 A distributed file system built with C, POSIX sockets, and pthreads.  
 Implements a **Naming Server (NM) + Storage Server (SS) + Client** architecture.
 
-> **This branch adds Feature 1 (CREATE) and Feature 4 (VIEW).**
+> **This branch adds Feature 1 (CREATE), Feature 2 (INFO), Feature 4 (VIEW), UNDO, and EXEC.**
 
 ---
 
@@ -81,11 +81,13 @@ mkdir -p ss_storage2 && echo "hello from ss2" > ss_storage2/file2.txt
 | `VIEW -al` | **Feature 4** | All files with full details |
 | `READ <filename>` | **READ** | Direct chunked read & display a file's contents |
 | `STREAM <filename>` | **READ** | Word-by-word content streaming with 0.1s delay |
-| `WRITE <filename> <sentence_num>` | **WRITE** | Edit a file at the word/sentence level |
+| `INFO <filename>` | **INFO** | Get metadata for a file |
+| `WRITE <filename> <s#>` | **WRITE** | Edit a file at the word/sentence level |
+| `UNDO <filename>` | **UNDO** | Revert the last WRITE |
 | `DELETE <filename>` | **DELETE**| Cascading deletion & NM tracking eviction (owner only) |
 | `ADDACCESS -R/-W <file> <user>` | **ACCESS**| Grant read or read/write access to a user |
 | `REMACCESS <file> <user>` | **ACCESS**| Revoke access from a user |
-| `INFO <filename>` | **INFO** | View file metadata and your current access level |
+| `EXEC <filename>` | **EXEC** | Run file as bash script on NM |
 | `LIST` | **Feature 3** | Show all currently connected/registered users |
 | `help` | — | Show command reference |
 | `exit` | — | Disconnect |

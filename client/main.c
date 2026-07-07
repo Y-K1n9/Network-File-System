@@ -328,6 +328,140 @@ static void cmd_delete(const char *username, const char *filename) {
     }
 }
 
+/* --- cmd_info ------------------------------------------------------------- */
+static void cmd_info(const char *username, const char *filename) {
+    if (!filename || filename[0] == '\0') {
+        print_err("Usage: INFO <filename>");
+        return;
+    }
+
+    printf(CLR_DIM "  Fetching metadata for '%s'...\n" CLR_RESET, filename);
+
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    InfoRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_INFO;
+    strncpy(req.username, username, MAX_USERNAME - 1);
+    strncpy(req.filename, filename, MAX_FILENAME - 1);
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send INFO request.");
+        close(sockfd);
+        return;
+    }
+
+    InfoResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
+        print_err("No response from Name Server.");
+        close(sockfd);
+        return;
+    }
+    close(sockfd);
+
+    if (resp.status == ERR_OK) {
+        printf("\n" CLR_CYAN "  [ File Metadata: %s ]\n" CLR_RESET, filename);
+        printf("  Owner:        %s\n", resp.owner);
+        printf("  Size:         %lld bytes\n", (long long)resp.size_bytes);
+        printf("  Words:        %d\n", resp.word_count);
+        printf("  Characters:   %d\n", resp.char_count);
+        
+        const char *acl_str = "NONE";
+        if (resp.access_level == 2) acl_str = "READ+WRITE";
+        else if (resp.access_level == 1) acl_str = "READ";
+        printf("  Access Level: %s\n\n", acl_str);
+    } else {
+        print_err(resp.message);
+    }
+}
+
+/* --- cmd_undo ------------------------------------------------------------- */
+static void cmd_undo(const char *username, const char *filename) {
+    if (!filename || filename[0] == '\0') {
+        print_err("Usage: UNDO <filename>");
+        return;
+    }
+
+    printf(CLR_DIM "  Undoing last write on '%s'...\n" CLR_RESET, filename);
+
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    UndoRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_UNDO;
+    strncpy(req.username, username, MAX_USERNAME - 1);
+    strncpy(req.filename, filename, MAX_FILENAME - 1);
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send UNDO request.");
+        close(sockfd);
+        return;
+    }
+
+    UndoResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
+        print_err("No response from Name Server.");
+        close(sockfd);
+        return;
+    }
+    close(sockfd);
+
+    if (resp.status == ERR_OK) {
+        print_ok(resp.message);
+    } else {
+        print_err(resp.message);
+    }
+}
+
+/* --- cmd_exec ------------------------------------------------------------- */
+static void cmd_exec(const char *username, const char *filename) {
+    if (!filename || filename[0] == '\0') {
+        print_err("Usage: EXEC <filename>");
+        return;
+    }
+
+    printf(CLR_DIM "  Executing script '%s' on Name Server...\n" CLR_RESET, filename);
+
+    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    if (sockfd < 0) {
+        print_err("Cannot connect to Name Server.");
+        return;
+    }
+
+    ExecRequestPacket req;
+    memset(&req, 0, sizeof(req));
+    req.command_type = CMD_EXEC;
+    strncpy(req.username, username, MAX_USERNAME - 1);
+    strncpy(req.filename, filename, MAX_FILENAME - 1);
+
+    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
+        print_err("Failed to send EXEC request.");
+        close(sockfd);
+        return;
+    }
+
+    printf("\n" CLR_CYAN "─── EXEC OUTPUT ────────────────────────────────────\n" CLR_RESET);
+    while (1) {
+        FileChunkPacket chunk;
+        if (recv_struct(sockfd, &chunk, sizeof(chunk)) < 0) break;
+        if (chunk.chunk_size == 0) break;
+        fwrite(chunk.data, 1, chunk.chunk_size, stdout);
+        fflush(stdout);
+    }
+    printf(CLR_CYAN "────────────────────────────────────────────────────\n" CLR_RESET);
+    close(sockfd);
+}
+
 /* --- cmd_write ------------------------------------------------------------ */
 static void cmd_write(const char *username, const char *filename, int sentence_number) {
     if (sentence_number < 0) {
@@ -799,10 +933,13 @@ static void print_help(void) {
     printf("  " CLR_BOLD "VIEW -a" CLR_RESET "            List ALL files on the system\n");
     printf("  " CLR_BOLD "VIEW -l" CLR_RESET "            Detailed listing (words, chars, timestamps)\n");
     printf("  " CLR_BOLD "VIEW -al" CLR_RESET "           All files with full details\n");
+    printf("  " CLR_BOLD "INFO" CLR_RESET " <filename>      Get metadata for a file\n");
     printf("  " CLR_BOLD "READ" CLR_RESET " <filename>    Read and display a file's contents\n");
-    printf("  " CLR_BOLD "STREAM" CLR_RESET " <filename>  Stream a file's contents word-by-word with delay\n");
+    printf("  " CLR_BOLD "STREAM" CLR_RESET " <filename>  Stream a file's contents word-by-word\n");
     printf("  " CLR_BOLD "WRITE" CLR_RESET " <filename> <sentence_num>  Edit a file at word/sentence level\n");
+    printf("  " CLR_BOLD "UNDO" CLR_RESET " <filename>    Revert the last WRITE to a file\n");
     printf("  " CLR_BOLD "DELETE" CLR_RESET " <filename>  Delete a file from the NFS (owner only)\n");
+    printf("  " CLR_BOLD "EXEC" CLR_RESET " <filename>    Run a file as a bash script on the NM\n");
     printf("  " CLR_BOLD "LIST" CLR_RESET "               Show all connected users\n");
     printf("  " CLR_BOLD "ADDACCESS" CLR_RESET " -R|-W <file> <user>  Grant read/write access to a user\n");
     printf("  " CLR_BOLD "REMACCESS" CLR_RESET " <file> <user>     Revoke access from a user\n");
@@ -939,6 +1076,19 @@ static void repl(const char *username) {
             } else {
                 print_err("Usage: REMACCESS <filename> <username>");
             }
+=======
+        /* UNDO <filename> */
+        if (strncasecmp(cmd, "UNDO ", 5) == 0) {
+            char *fname = trim(cmd + 5);
+            cmd_undo(username, fname);
+            continue;
+        }
+
+        /* EXEC <filename> */
+        if (strncasecmp(cmd, "EXEC ", 5) == 0) {
+            char *fname = trim(cmd + 5);
+            cmd_exec(username, fname);
+>>>>>>> dbde696 (feat: Add UNDO and EXEC features)
             continue;
         }
 

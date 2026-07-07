@@ -507,6 +507,7 @@ static void handle_info(int fd, int32_t cmd_type, const char *peer_ip) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+
  *  ACCESS CONTROL handlers
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void handle_addaccess(int fd, int32_t cmd_type, const char *peer_ip) {
@@ -573,6 +574,234 @@ static void handle_remaccess(int fd, int32_t cmd_type, const char *peer_ip) {
         nm_log("REMACCESS FAIL: internal error.");
     }
     send_struct(fd, &resp, sizeof(resp));
+
+ *  CMD_UNDO handler (Feature 1)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void handle_undo(int fd, int32_t cmd_type, const char *peer_ip) {
+    UndoRequestPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd, ((char *)&req) + sizeof(int32_t),
+                    sizeof(req) - sizeof(int32_t)) != 0) {
+        nm_log("Failed to read UndoRequestPacket from %s.", peer_ip);
+        return;
+    }
+
+    nm_log("UNDO request: file='%s' user='%s' from %s",
+           req.filename, req.username, peer_ip);
+
+    UndoResponsePacket resp;
+    memset(&resp, 0, sizeof(resp));
+
+    int access_level = registry_user_has_access(req.filename, req.username);
+    if (access_level < 2) {
+        resp.status = ERR_NO_PERMISSION;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: You need WRITE access to UNDO changes to '%s'.", req.filename);
+        nm_log("UNDO FAIL: user '%s' lacks write permission for '%s'.",
+               req.username, req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+
+    StorageServer *ss = registry_find_ss_for_file(req.filename);
+    if (!ss) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: File '%s' not found in registry.", req.filename);
+        nm_log("UNDO failed: '%s' not in registry.", req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+
+    if (ss->status != SS_STATUS_ONLINE) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: SS holding '%s' is offline.", req.filename);
+        nm_log("UNDO FAIL: SS offline for '%s'.", req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+
+    int ss_fd = connect_to_server(ss->ip, ss->client_port);
+    if (ss_fd < 0) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: Cannot connect to SS for '%s'.", req.filename);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
+    }
+
+    SSUndoPacket ss_req;
+    memset(&ss_req, 0, sizeof(ss_req));
+    ss_req.command_type = CMD_SS_UNDO;
+    strncpy(ss_req.filename, req.filename, MAX_FILENAME - 1);
+
+    if (send_struct(ss_fd, &ss_req, sizeof(ss_req)) != 0) {
+        resp.status = ERR_INTERNAL;
+        snprintf(resp.message, sizeof(resp.message), "ERROR: Failed to send request to SS.");
+        send_struct(fd, &resp, sizeof(resp));
+        close(ss_fd);
+        return;
+    }
+
+    SSUndoAck ack;
+    memset(&ack, 0, sizeof(ack));
+    if (recv_struct(ss_fd, &ack, sizeof(ack)) != 0 || ack.status != ERR_OK) {
+        resp.status = ERR_FILE_NOT_FOUND;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ERROR: Failed to UNDO changes. Either no backup exists, or server error.");
+        nm_log("UNDO FAIL: SS could not undo '%s'.", req.filename);
+    } else {
+        resp.status = ERR_OK;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Successfully reverted last changes for '%s'.", req.filename);
+        nm_log("UNDO OK: '%s' restored.", req.filename);
+    }
+    close(ss_fd);
+    send_struct(fd, &resp, sizeof(resp));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  CMD_EXEC handler (Feature 3)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void handle_exec(int fd, int32_t cmd_type, const char *peer_ip) {
+    ExecRequestPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd, ((char *)&req) + sizeof(int32_t),
+                    sizeof(req) - sizeof(int32_t)) != 0) {
+        nm_log("Failed to read ExecRequestPacket from %s.", peer_ip);
+        return;
+    }
+
+    nm_log("EXEC request: file='%s' user='%s' from %s",
+           req.filename, req.username, peer_ip);
+
+    int access_level = registry_user_has_access(req.filename, req.username);
+    if (access_level < 1) {
+        FileChunkPacket err_chunk;
+        memset(&err_chunk, 0, sizeof(err_chunk));
+        err_chunk.chunk_size = snprintf(err_chunk.data, sizeof(err_chunk.data),
+                                        "ERROR: You need access to EXEC '%s'.\n", req.filename);
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        err_chunk.chunk_size = 0;
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        return;
+    }
+
+    /* 1. Fetch file from an SS */
+    StorageServer *ss = registry_find_ss_for_file(req.filename);
+    if (!ss) {
+        FileChunkPacket err_chunk;
+        memset(&err_chunk, 0, sizeof(err_chunk));
+        err_chunk.chunk_size = snprintf(err_chunk.data, sizeof(err_chunk.data),
+                                        "ERROR: File '%s' not found.\n", req.filename);
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        err_chunk.chunk_size = 0;
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        return;
+    }
+
+    if (ss->status != SS_STATUS_ONLINE) {
+        FileChunkPacket err_chunk;
+        memset(&err_chunk, 0, sizeof(err_chunk));
+        err_chunk.chunk_size = snprintf(err_chunk.data, sizeof(err_chunk.data),
+                                        "ERROR: SS for '%s' is offline.\n", req.filename);
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        err_chunk.chunk_size = 0;
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        return;
+    }
+
+    int ss_fd = connect_to_server(ss->ip, ss->client_port);
+    if (ss_fd < 0) {
+        FileChunkPacket err_chunk;
+        memset(&err_chunk, 0, sizeof(err_chunk));
+        err_chunk.chunk_size = snprintf(err_chunk.data, sizeof(err_chunk.data),
+                                        "ERROR: Cannot connect to SS for '%s'.\n", req.filename);
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        err_chunk.chunk_size = 0;
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        return;
+    }
+
+    int32_t cmd_read = CMD_FILE_READ;
+    char fname_buf[MAX_FILENAME] = {0};
+    strncpy(fname_buf, req.filename, MAX_FILENAME - 1);
+    send_all(ss_fd, &cmd_read, sizeof(cmd_read));
+    send_all(ss_fd, fname_buf, sizeof(fname_buf));
+
+    ReadResponseHeader hdr;
+    if (recv_struct(ss_fd, &hdr, sizeof(hdr)) < 0 || hdr.status != ERR_OK) {
+        FileChunkPacket err_chunk;
+        memset(&err_chunk, 0, sizeof(err_chunk));
+        err_chunk.chunk_size = snprintf(err_chunk.data, sizeof(err_chunk.data),
+                                        "ERROR: SS could not read '%s'.\n", req.filename);
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        err_chunk.chunk_size = 0;
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        close(ss_fd);
+        return;
+    }
+
+    char tmp_script[128];
+    snprintf(tmp_script, sizeof(tmp_script), "/tmp/docs_exec_%d_%ld.sh", getpid(), (long)time(NULL));
+    FILE *f_script = fopen(tmp_script, "w");
+    if (!f_script) {
+        FileChunkPacket err_chunk;
+        memset(&err_chunk, 0, sizeof(err_chunk));
+        err_chunk.chunk_size = snprintf(err_chunk.data, sizeof(err_chunk.data),
+                                        "ERROR: NM failed to create temp script.\n");
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        err_chunk.chunk_size = 0;
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        close(ss_fd);
+        return;
+    }
+
+    while (1) {
+        FileChunkPacket chunk;
+        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) break;
+        if (chunk.chunk_size == 0) break;
+        fwrite(chunk.data, 1, chunk.chunk_size, f_script);
+    }
+    fclose(f_script);
+    close(ss_fd);
+
+    char cmd_buf[512];
+    snprintf(cmd_buf, sizeof(cmd_buf), "bash %s 2>&1", tmp_script);
+    FILE *p = popen(cmd_buf, "r");
+    if (!p) {
+        FileChunkPacket err_chunk;
+        memset(&err_chunk, 0, sizeof(err_chunk));
+        err_chunk.chunk_size = snprintf(err_chunk.data, sizeof(err_chunk.data),
+                                        "ERROR: NM failed to execute script.\n");
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        err_chunk.chunk_size = 0;
+        send_struct(fd, &err_chunk, sizeof(err_chunk));
+        remove(tmp_script);
+        return;
+    }
+
+    while (1) {
+        FileChunkPacket chunk;
+        memset(&chunk, 0, sizeof(chunk));
+        size_t bytes = fread(chunk.data, 1, sizeof(chunk.data), p);
+        if (bytes > 0) {
+            chunk.chunk_size = (int32_t)bytes;
+            send_struct(fd, &chunk, sizeof(chunk));
+        } else {
+            break;
+        }
+    }
+    pclose(p);
+    remove(tmp_script);
+
+    FileChunkPacket end_chunk;
+    memset(&end_chunk, 0, sizeof(end_chunk));
+    end_chunk.chunk_size = 0;
+    send_struct(fd, &end_chunk, sizeof(end_chunk));
+    nm_log("EXEC OK: streamed output for '%s' to %s", req.filename, peer_ip);
+
 }
 
 /* --- Main connection dispatcher ------------------------------------------- */
@@ -622,6 +851,12 @@ static void *handle_connection(void *arg) {
             break;
         case CMD_REMACCESS:
             handle_remaccess(fd, cmd_type, peer_ip);
+            break;
+        case CMD_UNDO:
+            handle_undo(fd, cmd_type, peer_ip);
+            break;
+        case CMD_EXEC:
+            handle_exec(fd, cmd_type, peer_ip);
             break;
         default:
             nm_log("Unknown command %d from %s — ignored.", cmd_type, peer_ip);

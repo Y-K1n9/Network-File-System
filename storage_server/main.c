@@ -211,6 +211,66 @@ static void handle_ss_delete(int fd, int32_t cmd_type) {
     send_struct(fd, &ack, sizeof(ack));
 }
 
+/* --- Handler: CMD_SS_UNDO ------------------------------------------------- */
+static void handle_ss_undo(int fd, int32_t cmd_type) {
+    SSUndoPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd,
+                    ((char *)&req) + sizeof(int32_t),
+                    sizeof(req)    - sizeof(int32_t)) != 0) {
+        ss_log("Failed to receive SSUndoPacket.");
+        return;
+    }
+
+    ss_log("UNDO request: file='%s'", req.filename);
+
+    SSUndoAck ack;
+    memset(&ack, 0, sizeof(ack));
+
+    if (contains_path_traversal(req.filename)) {
+        ack.status = ERR_INTERNAL;
+        snprintf(ack.message, sizeof(ack.message),
+                 "ERROR: Invalid filename '%s'.", req.filename);
+        send_struct(fd, &ack, sizeof(ack));
+        return;
+    }
+
+    char path[MAX_PATH_LEN + MAX_FILENAME + 2];
+    snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
+
+    char bak_path[MAX_PATH_LEN + MAX_FILENAME + 6];
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", path);
+
+    if (rename(bak_path, path) != 0) {
+        ack.status = ERR_FILE_NOT_FOUND;
+        snprintf(ack.message, sizeof(ack.message),
+                 "No backup available to undo for '%s'.", req.filename);
+        ss_log("UNDO failed: no backup found for '%s'.", req.filename);
+    } else {
+        int words = 0, chars = 0;
+        long bytes = 0;
+        count_file_stats(g_storage_dir, req.filename, &words, &chars, &bytes);
+
+        int nm_fd = connect_to_server(g_nm_ip, g_nm_port);
+        if (nm_fd >= 0) {
+            SSUpdateStatsPacket stats_pkt;
+            stats_pkt.command_type = CMD_SS_UPDATE_STATS;
+            strncpy(stats_pkt.filename, req.filename, MAX_FILENAME - 1);
+            stats_pkt.word_count = words;
+            stats_pkt.char_count = chars;
+            stats_pkt.size_bytes = bytes;
+            send_struct(nm_fd, &stats_pkt, sizeof(stats_pkt));
+            close(nm_fd);
+        }
+        
+        ack.status = ERR_OK;
+        snprintf(ack.message, sizeof(ack.message),
+                 "Reverted last change for '%s'.", req.filename);
+        ss_log("UNDO OK: '%s' restored from backup.", req.filename);
+    }
+    send_struct(fd, &ack, sizeof(ack));
+}
+
 /* ==========================================================================
  *  WRITE / ETIRW — word-level editing
  * ========================================================================== */
@@ -528,6 +588,25 @@ static void handle_write(int fd, int32_t cmd_type) {
 
             char path[MAX_PATH_LEN + MAX_FILENAME + 2];
             snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
+            
+            char bak_path[MAX_PATH_LEN + MAX_FILENAME + 6];
+            snprintf(bak_path, sizeof(bak_path), "%s.bak", path);
+            
+            /* Backup existing file */
+            FILE *f_old = fopen(path, "rb");
+            if (f_old) {
+                FILE *f_bak = fopen(bak_path, "wb");
+                if (f_bak) {
+                    char tmp_buf[4096];
+                    size_t bytes;
+                    while ((bytes = fread(tmp_buf, 1, sizeof(tmp_buf), f_old)) > 0) {
+                        fwrite(tmp_buf, 1, bytes, f_bak);
+                    }
+                    fclose(f_bak);
+                }
+                fclose(f_old);
+            }
+
             FILE *f = fopen(path, "w");
             if (!f) {
                 WriteUpdateResponse upd_resp;
@@ -635,6 +714,9 @@ static void *handle_client_connection(void *arg) {
 
     } else if (cmd_type == CMD_WRITE) {
         handle_write(fd, cmd_type);
+
+    } else if (cmd_type == CMD_SS_UNDO) {
+        handle_ss_undo(fd, cmd_type);
 
     } else {
         ss_log("Unknown command %d — ignored.", cmd_type);

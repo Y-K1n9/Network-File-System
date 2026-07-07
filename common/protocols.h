@@ -82,7 +82,16 @@ typedef enum {
     CMD_ADDACCESS            = 29,  /* Client → NM   */
     CMD_ADDACCESS_RESP       = 30,  /* NM     → Client */
     CMD_REMACCESS            = 31,  /* Client → NM   */
-    CMD_REMACCESS_RESP       = 32   /* NM     → Client */
+    CMD_REMACCESS_RESP       = 32,  /* NM     → Client */
+
+    /* UNDO */
+    CMD_UNDO                 = 33,  /* Client → NM   */
+    CMD_UNDO_RESP            = 34,  /* NM     → Client */
+    CMD_SS_UNDO              = 35,  /* NM     → SS   */
+    CMD_SS_UNDO_ACK          = 36,  /* SS     → NM   */
+
+    /* EXEC */
+    CMD_EXEC                 = 37   /* Client → NM   */
 } CommandType;
 
 /* ==========================================================================
@@ -324,6 +333,7 @@ typedef struct {
 } InfoResponsePacket;
 
 /* ==========================================================================
+/* ==========================================================================
  *  Packet structs — ACCESS CONTROL
  * ========================================================================== */
 
@@ -341,5 +351,48 @@ typedef struct {
     int32_t status;
     char    message[MAX_MESSAGE];
 } AccessResponsePacket;
+
+/* ==========================================================================
+ *  Packet structs — UNDO
+ * ========================================================================== */
+
+/* Client → NM */
+typedef struct {
+    int32_t command_type;                      /* CMD_UNDO */
+    char    username[MAX_USERNAME];
+    char    filename[MAX_FILENAME];
+} UndoRequestPacket;
+
+/* NM → Client */
+typedef struct {
+    int32_t status;
+    char    message[MAX_MESSAGE];
+} UndoResponsePacket;
+
+/* NM → SS */
+typedef struct {
+    int32_t command_type;                      /* CMD_SS_UNDO */
+    char    filename[MAX_FILENAME];
+} SSUndoPacket;
+
+/* SS → NM */
+typedef struct {
+    int32_t status;
+    char    message[MAX_MESSAGE];
+} SSUndoAck;
+
+/* ==========================================================================
+ *  Packet structs — EXEC
+ * ========================================================================== */
+
+/* Client → NM */
+typedef struct {
+    int32_t command_type;                      /* CMD_EXEC */
+    char    username[MAX_USERNAME];
+    char    filename[MAX_FILENAME];
+} ExecRequestPacket;
+
+/* Output chunk (NM → Client) uses FileChunkPacket */
+>>>>>>> dbde696 (feat: Add UNDO and EXEC features)
 
 #endif /* PROTOCOLS_H */
