@@ -123,13 +123,22 @@ static void handle_client_lookup(int fd, int32_t cmd_type,
         snprintf(resp.message, sizeof(resp.message),
                  "ERROR: File '%s' not found.", packet.filename);
         nm_log("Lookup: file '%s' not found.", packet.filename);
-    } else if (registry_user_has_access(packet.filename, packet.username) == 0) {
-        resp.status = ERR_NO_PERMISSION;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Permission denied for file '%s'.", packet.filename);
-        nm_log("Lookup: permission denied for user '%s' on file '%s'.",
-               packet.username, packet.filename);
     } else {
+        int access_level = registry_user_has_access(packet.filename, packet.username);
+        int has_access = 0;
+        if (packet.intended_operation == CMD_WRITE) {
+            has_access = (access_level >= 2);
+        } else {
+            has_access = (access_level >= 1);
+        }
+
+        if (!has_access) {
+            resp.status = ERR_NO_PERMISSION;
+            snprintf(resp.message, sizeof(resp.message),
+                     "ERROR: Permission denied for file '%s'.", packet.filename);
+            nm_log("Lookup: permission denied for user '%s' on file '%s' (op=%d, level=%d).",
+                   packet.username, packet.filename, packet.intended_operation, access_level);
+        } else {
         StorageServer *ss = registry_find_ss_for_file(packet.filename);
         if (!ss) {
             resp.status = ERR_FILE_UNAVAILABLE;
@@ -146,6 +155,7 @@ static void handle_client_lookup(int fd, int32_t cmd_type,
                      packet.filename, ss->ip, ss->client_port);
             nm_log("Lookup OK: '%s' → %s:%d", packet.filename,
                    ss->ip, ss->client_port);
+        }
         }
     }
     send_struct(fd, &resp, sizeof(resp));
@@ -574,8 +584,10 @@ static void handle_remaccess(int fd, int32_t cmd_type, const char *peer_ip) {
         nm_log("REMACCESS FAIL: internal error.");
     }
     send_struct(fd, &resp, sizeof(resp));
+}
 
- *  CMD_UNDO handler (Feature 1)
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  CMD_UNDO handler
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void handle_undo(int fd, int32_t cmd_type, const char *peer_ip) {
     UndoRequestPacket req;
@@ -758,6 +770,7 @@ static void handle_exec(int fd, int32_t cmd_type, const char *peer_ip) {
         return;
     }
 
+    /* Output chunk (NM → Client) uses FileChunkPacket */
     while (1) {
         FileChunkPacket chunk;
         if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) break;

@@ -107,7 +107,7 @@ static int register_client(const char *username) {
 
 /* --- CMD_CLIENT_LOOKUP ---------------------------------------------------- */
 static int lookup_file(const char *username, const char *filename,
-                        char *ss_ip, int *ss_port) {
+                        char *ss_ip, int *ss_port, int32_t intended_operation) {
     int sockfd = connect_to_server(NM_IP, NM_PORT);
     if (sockfd < 0) {
         print_err("Cannot connect to Name Server.");
@@ -119,6 +119,7 @@ static int lookup_file(const char *username, const char *filename,
     req.command_type = CMD_CLIENT_LOOKUP;
     strncpy(req.username, username, MAX_USERNAME - 1);
     strncpy(req.filename, filename, MAX_FILENAME - 1);
+    req.intended_operation = intended_operation;
 
     if (send_struct(sockfd, &req, sizeof(req)) < 0) {
         close(sockfd);
@@ -148,7 +149,7 @@ static void cmd_read(const char *username, const char *filename) {
 
     printf(CLR_DIM "  Looking up '%s'...\n" CLR_RESET, filename);
 
-    if (lookup_file(username, filename, ss_ip, &ss_port) < 0) return;
+    if (lookup_file(username, filename, ss_ip, &ss_port, CMD_FILE_READ) < 0) return;
 
     int ss_fd = connect_to_server(ss_ip, ss_port);
     if (ss_fd < 0) {
@@ -210,7 +211,7 @@ static void cmd_stream(const char *username, const char *filename) {
 
     printf(CLR_DIM "  Looking up '%s'...\n" CLR_RESET, filename);
 
-    if (lookup_file(username, filename, ss_ip, &ss_port) < 0) return;
+    if (lookup_file(username, filename, ss_ip, &ss_port, CMD_FILE_READ) < 0) return;
 
     int ss_fd = connect_to_server(ss_ip, ss_port);
     if (ss_fd < 0) {
@@ -328,57 +329,6 @@ static void cmd_delete(const char *username, const char *filename) {
     }
 }
 
-/* --- cmd_info ------------------------------------------------------------- */
-static void cmd_info(const char *username, const char *filename) {
-    if (!filename || filename[0] == '\0') {
-        print_err("Usage: INFO <filename>");
-        return;
-    }
-
-    printf(CLR_DIM "  Fetching metadata for '%s'...\n" CLR_RESET, filename);
-
-    int sockfd = connect_to_server(NM_IP, NM_PORT);
-    if (sockfd < 0) {
-        print_err("Cannot connect to Name Server.");
-        return;
-    }
-
-    InfoRequestPacket req;
-    memset(&req, 0, sizeof(req));
-    req.command_type = CMD_INFO;
-    strncpy(req.username, username, MAX_USERNAME - 1);
-    strncpy(req.filename, filename, MAX_FILENAME - 1);
-
-    if (send_struct(sockfd, &req, sizeof(req)) < 0) {
-        print_err("Failed to send INFO request.");
-        close(sockfd);
-        return;
-    }
-
-    InfoResponsePacket resp;
-    memset(&resp, 0, sizeof(resp));
-    if (recv_struct(sockfd, &resp, sizeof(resp)) < 0) {
-        print_err("No response from Name Server.");
-        close(sockfd);
-        return;
-    }
-    close(sockfd);
-
-    if (resp.status == ERR_OK) {
-        printf("\n" CLR_CYAN "  [ File Metadata: %s ]\n" CLR_RESET, filename);
-        printf("  Owner:        %s\n", resp.owner);
-        printf("  Size:         %lld bytes\n", (long long)resp.size_bytes);
-        printf("  Words:        %d\n", resp.word_count);
-        printf("  Characters:   %d\n", resp.char_count);
-        
-        const char *acl_str = "NONE";
-        if (resp.access_level == 2) acl_str = "READ+WRITE";
-        else if (resp.access_level == 1) acl_str = "READ";
-        printf("  Access Level: %s\n\n", acl_str);
-    } else {
-        print_err(resp.message);
-    }
-}
 
 /* --- cmd_undo ------------------------------------------------------------- */
 static void cmd_undo(const char *username, const char *filename) {
@@ -473,7 +423,7 @@ static void cmd_write(const char *username, const char *filename, int sentence_n
     int ss_port = 0;
 
     printf(CLR_DIM "  Looking up '%s'...\n" CLR_RESET, filename);
-    if (lookup_file(username, filename, ss_ip, &ss_port) < 0) return;
+    if (lookup_file(username, filename, ss_ip, &ss_port, CMD_WRITE) < 0) return;
 
     int ss_fd = connect_to_server(ss_ip, ss_port);
     if (ss_fd < 0) {
@@ -1076,7 +1026,9 @@ static void repl(const char *username) {
             } else {
                 print_err("Usage: REMACCESS <filename> <username>");
             }
-=======
+            continue;
+        }
+
         /* UNDO <filename> */
         if (strncasecmp(cmd, "UNDO ", 5) == 0) {
             char *fname = trim(cmd + 5);
@@ -1088,7 +1040,6 @@ static void repl(const char *username) {
         if (strncasecmp(cmd, "EXEC ", 5) == 0) {
             char *fname = trim(cmd + 5);
             cmd_exec(username, fname);
->>>>>>> dbde696 (feat: Add UNDO and EXEC features)
             continue;
         }
 

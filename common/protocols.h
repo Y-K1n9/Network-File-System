@@ -113,6 +113,7 @@ typedef struct {
     int32_t command_type;                      /* CMD_CLIENT_LOOKUP */
     char    username[MAX_USERNAME];
     char    filename[MAX_FILENAME];
+    int32_t intended_operation;
 } ClientLookupPacket;
 
 /* NM → Client: reply with SS address */
@@ -393,6 +394,5 @@ typedef struct {
 } ExecRequestPacket;
 
 /* Output chunk (NM → Client) uses FileChunkPacket */
->>>>>>> dbde696 (feat: Add UNDO and EXEC features)
 
 #endif /* PROTOCOLS_H */
