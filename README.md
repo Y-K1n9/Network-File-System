@@ -82,8 +82,6 @@ mkdir -p ss_storage2 && echo "hello from ss2" > ss_storage2/file2.txt
 | `READ <filename>` | **READ** | Direct chunked read & display a file's contents |
 | `STREAM <filename>` | **READ** | Word-by-word content streaming with 0.1s delay |
 | `WRITE <filename> <sentence_num>` | **WRITE** | Edit a file at the word/sentence level |
-| `UNDO <filename>` | **UNDO** | Revert the last change made to the file |
-| `EXEC <filename>` | **EXEC** | Execute shell commands on the Naming Server |
 | `DELETE <filename>` | **DELETE**| Cascading deletion & NM tracking eviction (owner only) |
 | `ADDACCESS -R/-W <file> <user>` | **ACCESS**| Grant read or read/write access to a user |
 | `REMACCESS <file> <user>` | **ACCESS**| Revoke access from a user |
@@ -348,13 +346,4 @@ Command IDs defined in `common/protocols.h`.
 ### 2026-07-05
 - **Access Control (`ADDACCESS`, `REMACCESS`)**: Added the ability for file owners to dynamically grant Read (`-R`), Read/Write (`-W`), or completely revoke access for other users. Integrated Access Control Lists (ACL) into the Naming Server registry.
 - **INFO Command Implementation**: Finished the missing implementation of `INFO` in the client CLI to display rich file metadata, including timestamps, sizes, and the current user's access level.
-
-### 2026-07-07
-- **Full Write Implementation**: Enhanced write handling to tokenise file contents into words and sentences.
-- **Sentence-Level Locking**: Added sentence-level locking on the Storage Server to prevent concurrent edits of the same sentence, returning `ERR_FILE_LOCKED` on conflict.
-- **Concurrent Access Control**: Implemented file-level reader-writer locks (`pthread_rwlock_t`) for concurrent reading across clients. Enabled concurrent editing sessions on different sentences of the same file.
-- **Lock Release & Dynamic Sync**: Ensured locks are fully released on `ETIRW` commit or client disconnection, and dynamically updated and shifted the target sentence indices of other active writer threads.
-- **UNDO Feature**: Reverts the last write transaction of a file. The Storage Server maintains a `.undo` backup file and restores it upon authorized request.
-- **STREAM Feature**: Connected client directly to SS to display contents word-by-word with a 0.1-second delay.
-- **EXEC Feature**: Executed file shell commands entirely on the Naming Server and redirected stdout/stderr back in real-time to the client interface.
-
+```

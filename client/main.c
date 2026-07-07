@@ -23,7 +23,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/socket.h>
 
 /* --- ANSI colour codes ---------------------------------------------------- */
 #define CLR_RESET   "\033[0m"
@@ -177,7 +176,8 @@ static void cmd_read(const char *username, const char *filename) {
         return;
     }
 
-    printf("\n" CLR_CYAN "─── %s ───────────────────────────────────\n" CLR_RESET, filename);
+    printf("\n" CLR_CYAN "─── %s ───────────────────────────────────\n" CLR_RESET,
+           filename);
 
     int success = 0;
     while (1) {
@@ -352,7 +352,6 @@ static void cmd_write(const char *username, const char *filename, int sentence_n
     start_pkt.command_type = CMD_WRITE;
     strncpy(start_pkt.filename, filename, MAX_FILENAME - 1);
     start_pkt.sentence_number = sentence_number;
-    strncpy(start_pkt.username, username, MAX_USERNAME - 1);
 
     if (send_struct(ss_fd, &start_pkt, sizeof(start_pkt)) < 0) {
         print_err("Failed to send WRITE request.");
@@ -436,103 +435,6 @@ static void cmd_write(const char *username, const char *filename, int sentence_n
         }
     }
     close(ss_fd);
-}
-
-/* --- cmd_undo ------------------------------------------------------------- */
-static void cmd_undo(const char *username, const char *filename) {
-    if (!filename || filename[0] == '\0') {
-        print_err("Usage: UNDO <filename>");
-        return;
-    }
-
-    char ss_ip[MAX_IP_LEN] = {0};
-    int ss_port = 0;
-
-    printf(CLR_DIM "  Looking up '%s'...\n" CLR_RESET, filename);
-    if (lookup_file(username, filename, ss_ip, &ss_port) < 0) return;
-
-    int ss_fd = connect_to_server(ss_ip, ss_port);
-    if (ss_fd < 0) {
-        print_err("Cannot connect to Storage Server.");
-        return;
-    }
-
-    UndoRequestPacket req;
-    memset(&req, 0, sizeof(req));
-    req.command_type = CMD_UNDO;
-    strncpy(req.username, username, MAX_USERNAME - 1);
-    strncpy(req.filename, filename, MAX_FILENAME - 1);
-
-    if (send_struct(ss_fd, &req, sizeof(req)) < 0) {
-        print_err("Failed to send UNDO request.");
-        close(ss_fd);
-        return;
-    }
-
-    UndoResponsePacket resp;
-    memset(&resp, 0, sizeof(resp));
-    if (recv_struct(ss_fd, &resp, sizeof(resp)) < 0) {
-        print_err("No response from Storage Server.");
-        close(ss_fd);
-        return;
-    }
-    close(ss_fd);
-
-    if (resp.status == ERR_OK) {
-        print_ok(resp.message);
-    } else {
-        print_err(resp.message);
-    }
-}
-
-/* --- cmd_exec ------------------------------------------------------------- */
-static void cmd_exec(const char *username, const char *filename) {
-    if (!filename || filename[0] == '\0') {
-        print_err("Usage: EXEC <filename>");
-        return;
-    }
-
-    int nm_fd = connect_to_server(NM_IP, NM_PORT);
-    if (nm_fd < 0) {
-        print_err("Cannot connect to Name Server.");
-        return;
-    }
-
-    ExecRequestPacket req;
-    memset(&req, 0, sizeof(req));
-    req.command_type = CMD_EXEC;
-    strncpy(req.username, username, MAX_USERNAME - 1);
-    strncpy(req.filename, filename, MAX_FILENAME - 1);
-
-    if (send_struct(nm_fd, &req, sizeof(req)) < 0) {
-        print_err("Failed to send EXEC request.");
-        close(nm_fd);
-        return;
-    }
-
-    ExecResponseHeader hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    if (recv_struct(nm_fd, &hdr, sizeof(hdr)) < 0) {
-        print_err("No response from Name Server.");
-        close(nm_fd);
-        return;
-    }
-
-    if (hdr.status != ERR_OK) {
-        print_err(hdr.message);
-        close(nm_fd);
-        return;
-    }
-
-    char buf[1024];
-    while (1) {
-        ssize_t n = recv(nm_fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) break;
-        buf[n] = '\0';
-        printf("%s", buf);
-        fflush(stdout);
-    }
-    close(nm_fd);
 }
 
 /* --- cmd_create ----------------------------------------------------------- */
@@ -900,8 +802,6 @@ static void print_help(void) {
     printf("  " CLR_BOLD "READ" CLR_RESET " <filename>    Read and display a file's contents\n");
     printf("  " CLR_BOLD "STREAM" CLR_RESET " <filename>  Stream a file's contents word-by-word with delay\n");
     printf("  " CLR_BOLD "WRITE" CLR_RESET " <filename> <sentence_num>  Edit a file at word/sentence level\n");
-    printf("  " CLR_BOLD "UNDO" CLR_RESET " <filename>     Revert the last change made to the file\n");
-    printf("  " CLR_BOLD "EXEC" CLR_RESET " <filename>     Execute the file content as shell commands\n");
     printf("  " CLR_BOLD "DELETE" CLR_RESET " <filename>  Delete a file from the NFS (owner only)\n");
     printf("  " CLR_BOLD "LIST" CLR_RESET "               Show all connected users\n");
     printf("  " CLR_BOLD "ADDACCESS" CLR_RESET " -R|-W <file> <user>  Grant read/write access to a user\n");
@@ -1015,20 +915,6 @@ static void repl(const char *username) {
         if (strncasecmp(cmd, "DELETE ", 7) == 0) {
             char *fname = trim(cmd + 7);
             cmd_delete(username, fname);
-            continue;
-        }
-
-        /* UNDO <filename> */
-        if (strncasecmp(cmd, "UNDO ", 5) == 0) {
-            char *fname = trim(cmd + 5);
-            cmd_undo(username, fname);
-            continue;
-        }
-
-        /* EXEC <filename> */
-        if (strncasecmp(cmd, "EXEC ", 5) == 0) {
-            char *fname = trim(cmd + 5);
-            cmd_exec(username, fname);
             continue;
         }
 

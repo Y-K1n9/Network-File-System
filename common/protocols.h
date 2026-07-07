@@ -82,12 +82,7 @@ typedef enum {
     CMD_ADDACCESS            = 29,  /* Client → NM   */
     CMD_ADDACCESS_RESP       = 30,  /* NM     → Client */
     CMD_REMACCESS            = 31,  /* Client → NM   */
-    CMD_REMACCESS_RESP       = 32,  /* NM     → Client */
-    CMD_CHECK_PERMISSION     = 33,  /* SS     → NM     */
-    CMD_UNDO                 = 34,  /* Client → SS     */
-    CMD_UNDO_RESP            = 35,  /* SS     → Client */
-    CMD_EXEC                 = 36,  /* Client → NM     */
-    CMD_EXEC_RESP            = 37   /* NM     → Client */
+    CMD_REMACCESS_RESP       = 32   /* NM     → Client */
 } CommandType;
 
 /* ==========================================================================
@@ -252,20 +247,7 @@ typedef struct {
     int32_t command_type;                      /* CMD_WRITE */
     char    filename[MAX_FILENAME];
     int32_t sentence_number;
-    char    username[MAX_USERNAME];
 } WriteStartPacket;
-
-/* SS → NM: check permission check */
-typedef struct {
-    int32_t command_type;                      /* CMD_CHECK_PERMISSION */
-    char    username[MAX_USERNAME];
-    char    filename[MAX_FILENAME];
-} PermissionCheckPacket;
-
-/* NM → SS: permission response */
-typedef struct {
-    int32_t level;                             /* 0=None, 1=Read, 2=Read+Write */
-} PermissionCheckResponse;
 
 /* SS → Client: write session ack */
 typedef struct {
@@ -359,35 +341,5 @@ typedef struct {
     int32_t status;
     char    message[MAX_MESSAGE];
 } AccessResponsePacket;
-
-/* ==========================================================================
- *  Packet structs — UNDO and EXEC
- * ========================================================================== */
-
-/* Client → SS: undo last write */
-typedef struct {
-    int32_t command_type;                      /* CMD_UNDO */
-    char    username[MAX_USERNAME];
-    char    filename[MAX_FILENAME];
-} UndoRequestPacket;
-
-/* SS → Client: undo ack */
-typedef struct {
-    int32_t status;
-    char    message[MAX_MESSAGE];
-} UndoResponsePacket;
-
-/* Client → NM: execute file content */
-typedef struct {
-    int32_t command_type;                      /* CMD_EXEC */
-    char    username[MAX_USERNAME];
-    char    filename[MAX_FILENAME];
-} ExecRequestPacket;
-
-/* NM → Client: exec execution header */
-typedef struct {
-    int32_t status;
-    char    message[MAX_MESSAGE];
-} ExecResponseHeader;
 
 #endif /* PROTOCOLS_H */

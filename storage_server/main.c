@@ -59,8 +59,6 @@ static int contains_path_traversal(const char *path) {
     return 0;
 }
 
-static pthread_rwlock_t *get_or_create_rwlock(const char *filename);
-
 /* --- Handler: CMD_FILE_READ ----------------------------------------------- */
 static void handle_file_read(int fd, const char *filename) {
     if (contains_path_traversal(filename)) {
@@ -74,20 +72,9 @@ static void handle_file_read(int fd, const char *filename) {
         return;
     }
 
-    pthread_rwlock_t *rwlock = get_or_create_rwlock(filename);
-    if (rwlock) {
-        pthread_rwlock_rdlock(rwlock);
-    }
-
     char *buffer = NULL;
     long  length = 0;
-    int read_res = read_file_into_buffer(g_storage_dir, filename, &buffer, &length);
-
-    if (rwlock) {
-        pthread_rwlock_unlock(rwlock);
-    }
-
-    if (read_res < 0) {
+    if (read_file_into_buffer(g_storage_dir, filename, &buffer, &length) < 0) {
         ReadResponseHeader hdr = {
             .command_type   = CMD_FILE_READ,
             .status         = ERR_FILE_NOT_FOUND,
@@ -241,76 +228,6 @@ typedef struct {
     Sentence sentences[MAX_SENTENCES];
     int      sentence_count;
 } FileContent;
-
-#define MAX_ACTIVE_LOCKS 128
-typedef struct {
-    char filename[MAX_FILENAME];
-    int sentence_number;
-    int client_fd;
-    int *p_sentence_number;
-    FileContent *fc;
-    int *p_N_start;
-} SentenceLock;
-
-static SentenceLock g_locks[MAX_ACTIVE_LOCKS];
-static int g_lock_count = 0;
-static pthread_mutex_t locks_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-#define MAX_FILES_LOCKS 256
-typedef struct {
-    char filename[MAX_FILENAME];
-    pthread_rwlock_t rwlock;
-} FileRWLock;
-
-static FileRWLock g_file_locks[MAX_FILES_LOCKS];
-static int g_file_lock_count = 0;
-static pthread_mutex_t file_locks_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static pthread_rwlock_t *get_or_create_rwlock(const char *filename) {
-    pthread_mutex_lock(&file_locks_mutex);
-    for (int i = 0; i < g_file_lock_count; i++) {
-        if (strcmp(g_file_locks[i].filename, filename) == 0) {
-            pthread_mutex_unlock(&file_locks_mutex);
-            return &g_file_locks[i].rwlock;
-        }
-    }
-    if (g_file_lock_count < MAX_FILES_LOCKS) {
-        strncpy(g_file_locks[g_file_lock_count].filename, filename, MAX_FILENAME - 1);
-        pthread_rwlock_init(&g_file_locks[g_file_lock_count].rwlock, NULL);
-        pthread_rwlock_t *ret = &g_file_locks[g_file_lock_count].rwlock;
-        g_file_lock_count++;
-        pthread_mutex_unlock(&file_locks_mutex);
-        return ret;
-    }
-    pthread_mutex_unlock(&file_locks_mutex);
-    return NULL;
-}
-
-static void sync_other_sessions(const char *filename, int committer_fd, int target_sentence, int new_count, const FileContent *committer_fc) {
-    int diff = new_count - 1;
-    for (int i = 0; i < g_lock_count; i++) {
-        SentenceLock *lock = &g_locks[i];
-        if (strcmp(lock->filename, filename) == 0 && lock->client_fd != committer_fd) {
-            if (*lock->p_sentence_number > target_sentence) {
-                *lock->p_sentence_number += diff;
-                lock->sentence_number = *lock->p_sentence_number;
-            }
-            *lock->p_N_start += diff;
-
-            FileContent *other_fc = lock->fc;
-            int num_to_shift = other_fc->sentence_count - (target_sentence + 1);
-            if (diff != 0 && num_to_shift > 0) {
-                memmove(&other_fc->sentences[target_sentence + new_count],
-                        &other_fc->sentences[target_sentence + 1],
-                        num_to_shift * sizeof(Sentence));
-            }
-            for (int j = 0; j < new_count; j++) {
-                other_fc->sentences[target_sentence + j] = committer_fc->sentences[target_sentence + j];
-            }
-            other_fc->sentence_count += diff;
-        }
-    }
-}
 
 static void parse_file_content(const char *text, FileContent *fc) {
     memset(fc, 0, sizeof(FileContent));
@@ -520,7 +437,7 @@ static void handle_write(int fd, int32_t cmd_type) {
         return;
     }
 
-    ss_log("WRITE start: file='%s' sentence=%d user='%s'", req.filename, req.sentence_number, req.username);
+    ss_log("WRITE start: file='%s' sentence=%d", req.filename, req.sentence_number);
 
     WriteStartResponse resp;
     memset(&resp, 0, sizeof(resp));
@@ -529,35 +446,6 @@ static void handle_write(int fd, int32_t cmd_type) {
         resp.status = ERR_INTERNAL;
         snprintf(resp.message, sizeof(resp.message),
                  "ERROR: Invalid filename '%s'.", req.filename);
-        send_struct(fd, &resp, sizeof(resp));
-        return;
-    }
-
-    // 1. Verify Write Permission with Naming Server
-    int has_perm = 0;
-    int nm_conn = connect_to_server(g_nm_ip, g_nm_port);
-    if (nm_conn >= 0) {
-        PermissionCheckPacket perm_pkt;
-        memset(&perm_pkt, 0, sizeof(perm_pkt));
-        perm_pkt.command_type = CMD_CHECK_PERMISSION;
-        strncpy(perm_pkt.username, req.username, MAX_USERNAME - 1);
-        strncpy(perm_pkt.filename, req.filename, MAX_FILENAME - 1);
-        
-        if (send_struct(nm_conn, &perm_pkt, sizeof(perm_pkt)) == 0) {
-            PermissionCheckResponse perm_resp;
-            if (recv_struct(nm_conn, &perm_resp, sizeof(perm_resp)) == 0) {
-                if (perm_resp.level == 2) {
-                    has_perm = 1;
-                }
-            }
-        }
-        close(nm_conn);
-    }
-    
-    if (!has_perm) {
-        resp.status = ERR_NO_PERMISSION;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Permission denied. Write access required.");
         send_struct(fd, &resp, sizeof(resp));
         return;
     }
@@ -605,69 +493,12 @@ static void handle_write(int fd, int32_t cmd_type) {
         return;
     }
 
-    int target_sentence = req.sentence_number;
-    int N_start = fc->sentence_count;
-
-    // 2. Sentence lock verification
-    pthread_mutex_lock(&locks_mutex);
-    int locked = 0;
-    for (int i = 0; i < g_lock_count; i++) {
-        if (strcmp(g_locks[i].filename, req.filename) == 0 && g_locks[i].sentence_number == target_sentence) {
-            locked = 1;
-            break;
-        }
-    }
-
-    if (locked) {
-        pthread_mutex_unlock(&locks_mutex);
-        resp.status = ERR_FILE_LOCKED;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Sentence locked by another user.");
-        send_struct(fd, &resp, sizeof(resp));
-        free(fc);
-        return;
-    }
-
-    int lock_added = 0;
-    if (g_lock_count < MAX_ACTIVE_LOCKS) {
-        strncpy(g_locks[g_lock_count].filename, req.filename, MAX_FILENAME - 1);
-        g_locks[g_lock_count].sentence_number   = target_sentence;
-        g_locks[g_lock_count].client_fd         = fd;
-        g_locks[g_lock_count].p_sentence_number = &target_sentence;
-        g_locks[g_lock_count].fc                = fc;
-        g_locks[g_lock_count].p_N_start         = &N_start;
-        g_lock_count++;
-        lock_added = 1;
-    }
-    pthread_mutex_unlock(&locks_mutex);
-
-    if (!lock_added) {
-        resp.status = ERR_INTERNAL;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Too many active locks in system.");
-        send_struct(fd, &resp, sizeof(resp));
-        free(fc);
-        return;
-    }
-
-    if (target_sentence == N) {
+    if (req.sentence_number == N) {
         if (N >= MAX_SENTENCES) {
             resp.status = ERR_INTERNAL;
             snprintf(resp.message, sizeof(resp.message),
                      "ERROR: Max sentences reached.");
             send_struct(fd, &resp, sizeof(resp));
-            // Cleanup lock
-            pthread_mutex_lock(&locks_mutex);
-            for (int i = 0; i < g_lock_count; i++) {
-                if (g_locks[i].client_fd == fd) {
-                    for (int j = i; j < g_lock_count - 1; j++) {
-                        g_locks[j] = g_locks[j + 1];
-                    }
-                    g_lock_count--;
-                    break;
-                }
-            }
-            pthread_mutex_unlock(&locks_mutex);
             free(fc);
             return;
         }
@@ -678,18 +509,6 @@ static void handle_write(int fd, int32_t cmd_type) {
     resp.status = ERR_OK;
     snprintf(resp.message, sizeof(resp.message), "OK");
     if (send_struct(fd, &resp, sizeof(resp)) < 0) {
-        // Cleanup lock
-        pthread_mutex_lock(&locks_mutex);
-        for (int i = 0; i < g_lock_count; i++) {
-            if (g_locks[i].client_fd == fd) {
-                for (int j = i; j < g_lock_count - 1; j++) {
-                    g_locks[j] = g_locks[j + 1];
-                }
-                g_lock_count--;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&locks_mutex);
         free(fc);
         return;
     }
@@ -705,27 +524,12 @@ static void handle_write(int fd, int32_t cmd_type) {
             /* ETIRW — commit */
             char *new_content = NULL;
             long new_len = 0;
-
-            pthread_rwlock_t *rwlock = get_or_create_rwlock(req.filename);
-            if (rwlock) {
-                pthread_rwlock_wrlock(rwlock);
-            }
-
             reconstruct_file_content(fc, &new_content, &new_len);
 
             char path[MAX_PATH_LEN + MAX_FILENAME + 2];
             snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
-
-            char undo_path[MAX_PATH_LEN + MAX_FILENAME + 8];
-            snprintf(undo_path, sizeof(undo_path), "%s/%s.undo", g_storage_dir, req.filename);
-            unlink(undo_path);
-            rename(path, undo_path);
-
             FILE *f = fopen(path, "w");
             if (!f) {
-                if (rwlock) {
-                    pthread_rwlock_unlock(rwlock);
-                }
                 WriteUpdateResponse upd_resp;
                 upd_resp.status = ERR_INTERNAL;
                 snprintf(upd_resp.message, sizeof(upd_resp.message),
@@ -739,27 +543,6 @@ static void handle_write(int fd, int32_t cmd_type) {
             }
             fclose(f);
             free(new_content);
-
-            // Dynamic shift and other sessions synchronization
-            pthread_mutex_lock(&locks_mutex);
-            int new_count = fc->sentence_count - N_start + 1;
-            sync_other_sessions(req.filename, fd, target_sentence, new_count, fc);
-
-            // Remove lock on commit
-            for (int i = 0; i < g_lock_count; i++) {
-                if (g_locks[i].client_fd == fd) {
-                    for (int j = i; j < g_lock_count - 1; j++) {
-                        g_locks[j] = g_locks[j + 1];
-                    }
-                    g_lock_count--;
-                    break;
-                }
-            }
-            pthread_mutex_unlock(&locks_mutex);
-
-            if (rwlock) {
-                pthread_rwlock_unlock(rwlock);
-            }
 
             int words = 0, chars = 0;
             long bytes = 0;
@@ -789,7 +572,7 @@ static void handle_write(int fd, int32_t cmd_type) {
         } else {
             /* Word insertion */
             int word_idx = update.word_index;
-            Sentence *s = &fc->sentences[target_sentence];
+            Sentence *s = &fc->sentences[req.sentence_number];
             int W = s->word_count;
 
             if (W == 0 && word_idx == 1) {
@@ -805,7 +588,7 @@ static void handle_write(int fd, int32_t cmd_type) {
                 break;
             }
 
-            if (insert_content_at_index(fc, target_sentence, word_idx, update.content) < 0) {
+            if (insert_content_at_index(fc, req.sentence_number, word_idx, update.content) < 0) {
                 WriteUpdateResponse upd_resp;
                 upd_resp.status = ERR_INTERNAL;
                 snprintf(upd_resp.message, sizeof(upd_resp.message),
@@ -822,126 +605,7 @@ static void handle_write(int fd, int32_t cmd_type) {
             }
         }
     }
-
-    // Auto cleanup of lock on exit
-    pthread_mutex_lock(&locks_mutex);
-    for (int i = 0; i < g_lock_count; i++) {
-        if (g_locks[i].client_fd == fd) {
-            for (int j = i; j < g_lock_count - 1; j++) {
-                g_locks[j] = g_locks[j + 1];
-            }
-            g_lock_count--;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&locks_mutex);
-
     free(fc);
-}
-
-/* --- Handler: CMD_UNDO ---------------------------------------------------- */
-static void handle_undo(int fd, int32_t cmd_type) {
-    UndoRequestPacket req;
-    req.command_type = cmd_type;
-    if (recv_struct(fd,
-                    ((char *)&req) + sizeof(int32_t),
-                    sizeof(req)    - sizeof(int32_t)) != 0) {
-        ss_log("Failed to receive UndoRequestPacket.");
-        return;
-    }
-
-    ss_log("UNDO request: file='%s' user='%s'", req.filename, req.username);
-
-    UndoResponsePacket resp;
-    memset(&resp, 0, sizeof(resp));
-
-    // 1. Verify Write Permission with Naming Server
-    int has_perm = 0;
-    int nm_conn = connect_to_server(g_nm_ip, g_nm_port);
-    if (nm_conn >= 0) {
-        PermissionCheckPacket perm_pkt;
-        memset(&perm_pkt, 0, sizeof(perm_pkt));
-        perm_pkt.command_type = CMD_CHECK_PERMISSION;
-        strncpy(perm_pkt.username, req.username, MAX_USERNAME - 1);
-        strncpy(perm_pkt.filename, req.filename, MAX_FILENAME - 1);
-        
-        if (send_struct(nm_conn, &perm_pkt, sizeof(perm_pkt)) == 0) {
-            PermissionCheckResponse perm_resp;
-            if (recv_struct(nm_conn, &perm_resp, sizeof(perm_resp)) == 0) {
-                if (perm_resp.level == 2) {
-                    has_perm = 1;
-                }
-            }
-        }
-        close(nm_conn);
-    }
-    
-    if (!has_perm) {
-        resp.status = ERR_NO_PERMISSION;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Permission denied. Write access required.");
-        send_struct(fd, &resp, sizeof(resp));
-        return;
-    }
-
-    char path[MAX_PATH_LEN + MAX_FILENAME + 2];
-    snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
-
-    char undo_path[MAX_PATH_LEN + MAX_FILENAME + 8];
-    snprintf(undo_path, sizeof(undo_path), "%s/%s.undo", g_storage_dir, req.filename);
-
-    struct stat st;
-    if (stat(undo_path, &st) != 0) {
-        resp.status = ERR_FILE_NOT_FOUND;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: No undo history available for '%s'.", req.filename);
-        send_struct(fd, &resp, sizeof(resp));
-        return;
-    }
-
-    // Restore the backup
-    pthread_rwlock_t *rwlock = get_or_create_rwlock(req.filename);
-    if (rwlock) {
-        pthread_rwlock_wrlock(rwlock);
-    }
-
-    unlink(path);
-    if (rename(undo_path, path) != 0) {
-        if (rwlock) {
-            pthread_rwlock_unlock(rwlock);
-        }
-        resp.status = ERR_INTERNAL;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Failed to restore backup for '%s'.", req.filename);
-        send_struct(fd, &resp, sizeof(resp));
-        return;
-    }
-
-    if (rwlock) {
-        pthread_rwlock_unlock(rwlock);
-    }
-
-    // Push new stats to NM
-    int words = 0, chars = 0;
-    long bytes = 0;
-    count_file_stats(g_storage_dir, req.filename, &words, &chars, &bytes);
-
-    int nm_fd = connect_to_server(g_nm_ip, g_nm_port);
-    if (nm_fd >= 0) {
-        SSUpdateStatsPacket stats_pkt;
-        stats_pkt.command_type = CMD_SS_UPDATE_STATS;
-        strncpy(stats_pkt.filename, req.filename, MAX_FILENAME - 1);
-        stats_pkt.word_count = words;
-        stats_pkt.char_count = chars;
-        stats_pkt.size_bytes = bytes;
-        send_struct(nm_fd, &stats_pkt, sizeof(stats_pkt));
-        close(nm_fd);
-        ss_log("Sent updated stats after UNDO for '%s' to NM", req.filename);
-    }
-
-    resp.status = ERR_OK;
-    snprintf(resp.message, sizeof(resp.message), "Undo Successful!");
-    send_struct(fd, &resp, sizeof(resp));
 }
 
 /* --- Per-connection thread ------------------------------------------------ */
@@ -971,9 +635,6 @@ static void *handle_client_connection(void *arg) {
 
     } else if (cmd_type == CMD_WRITE) {
         handle_write(fd, cmd_type);
-
-    } else if (cmd_type == CMD_UNDO) {
-        handle_undo(fd, cmd_type);
 
     } else {
         ss_log("Unknown command %d — ignored.", cmd_type);

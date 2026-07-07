@@ -19,7 +19,6 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 /* --- Logging -------------------------------------------------------------- */
@@ -151,170 +150,6 @@ static void handle_client_lookup(int fd, int32_t cmd_type,
     }
     send_struct(fd, &resp, sizeof(resp));
 }
-
-/* --- Handler: CMD_CHECK_PERMISSION ---------------------------------------- */
-static void handle_check_permission(int fd, int32_t cmd_type,
-                                      const char *peer_ip) {
-    PermissionCheckPacket packet;
-    packet.command_type = cmd_type;
-    if (recv_struct(fd,
-                    ((char *)&packet) + sizeof(int32_t),
-                    sizeof(packet)    - sizeof(int32_t)) != 0) {
-        nm_log("Failed to receive PermissionCheckPacket from %s", peer_ip);
-        return;
-    }
-
-    PermissionCheckResponse resp;
-    resp.level = registry_user_has_access(packet.filename, packet.username);
-    send_struct(fd, &resp, sizeof(resp));
-}
-
-/* --- Handler: CMD_EXEC ---------------------------------------------------- */
-static void handle_exec(int fd, int32_t cmd_type, const char *peer_ip) {
-    ExecRequestPacket req;
-    req.command_type = cmd_type;
-    if (recv_struct(fd,
-                    ((char *)&req) + sizeof(int32_t),
-                    sizeof(req)    - sizeof(int32_t)) != 0) {
-        nm_log("Failed to receive ExecRequestPacket from %s", peer_ip);
-        return;
-    }
-
-    nm_log("EXEC request: file='%s' by user='%s' from %s",
-           req.filename, req.username, peer_ip);
-
-    ExecResponseHeader resp;
-    memset(&resp, 0, sizeof(resp));
-
-    int level = registry_user_has_access(req.filename, req.username);
-    if (level <= 0) {
-        resp.status = ERR_NO_PERMISSION;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Permission denied. Read access required.");
-        send_struct(fd, &resp, sizeof(resp));
-        nm_log("EXEC denied: user '%s' lacks read permission on '%s'",
-               req.username, req.filename);
-        return;
-    }
-
-    if (!registry_file_exists(req.filename)) {
-        resp.status = ERR_FILE_NOT_FOUND;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: File '%s' not found.", req.filename);
-        send_struct(fd, &resp, sizeof(resp));
-        nm_log("EXEC denied: '%s' not found.", req.filename);
-        return;
-    }
-
-    StorageServer *ss = registry_find_ss_for_file(req.filename);
-    if (!ss || ss->status != SS_STATUS_ONLINE) {
-        resp.status = ERR_FILE_UNAVAILABLE;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Storage Server hosting '%s' is offline.", req.filename);
-        send_struct(fd, &resp, sizeof(resp));
-        nm_log("EXEC denied: SS for '%s' is offline.", req.filename);
-        return;
-    }
-
-    int ss_fd = connect_to_server(ss->ip, ss->client_port);
-    if (ss_fd < 0) {
-        resp.status = ERR_FILE_UNAVAILABLE;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Cannot connect to Storage Server at %s:%d.", ss->ip, ss->client_port);
-        send_struct(fd, &resp, sizeof(resp));
-        nm_log("EXEC: cannot connect to SS at %s:%d", ss->ip, ss->client_port);
-        return;
-    }
-
-    int32_t cmd = CMD_FILE_READ;
-    char fname_buf[MAX_FILENAME] = {0};
-    strncpy(fname_buf, req.filename, MAX_FILENAME - 1);
-    send_all(ss_fd, &cmd, sizeof(cmd));
-    send_all(ss_fd, fname_buf, sizeof(fname_buf));
-
-    ReadResponseHeader rd_hdr;
-    if (recv_struct(ss_fd, &rd_hdr, sizeof(rd_hdr)) < 0 || rd_hdr.status != ERR_OK) {
-        resp.status = ERR_FILE_NOT_FOUND;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: File not found on Storage Server.");
-        send_struct(fd, &resp, sizeof(resp));
-        close(ss_fd);
-        nm_log("EXEC: SS returned error for read of '%s'.", req.filename);
-        return;
-    }
-
-    if (rd_hdr.content_length <= 0) {
-        resp.status = ERR_OK;
-        snprintf(resp.message, sizeof(resp.message), "OK");
-        send_struct(fd, &resp, sizeof(resp));
-        close(ss_fd);
-        nm_log("EXEC OK: file '%s' is empty, nothing to run.", req.filename);
-        return;
-    }
-
-    char *script_content = malloc((size_t)rd_hdr.content_length + 1);
-    if (!script_content) {
-        resp.status = ERR_INTERNAL;
-        snprintf(resp.message, sizeof(resp.message), "ERROR: Out of memory on NM.");
-        send_struct(fd, &resp, sizeof(resp));
-        close(ss_fd);
-        return;
-    }
-
-    long received = 0;
-    while (1) {
-        FileChunkPacket chunk;
-        if (recv_struct(ss_fd, &chunk, sizeof(chunk)) < 0) break;
-        if (chunk.chunk_size == 0) break;
-        if (received + chunk.chunk_size <= rd_hdr.content_length) {
-            memcpy(script_content + received, chunk.data, (size_t)chunk.chunk_size);
-            received += chunk.chunk_size;
-        }
-    }
-    script_content[received] = '\0';
-    close(ss_fd);
-
-    resp.status = ERR_OK;
-    snprintf(resp.message, sizeof(resp.message), "OK");
-    if (send_struct(fd, &resp, sizeof(resp)) < 0) {
-        free(script_content);
-        return;
-    }
-
-    int p_fds[2];
-    if (pipe(p_fds) < 0) {
-        free(script_content);
-        return;
-    }
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child
-        dup2(p_fds[0], STDIN_FILENO);
-        dup2(fd, STDOUT_FILENO);
-        dup2(fd, STDERR_FILENO);
-        close(p_fds[0]);
-        close(p_fds[1]);
-        close(fd);
-        execl("/bin/sh", "sh", (char *)NULL);
-        exit(1);
-    } else {
-        // Parent
-        close(p_fds[0]);
-        long written = 0;
-        while (written < received) {
-            ssize_t nw = write(p_fds[1], script_content + written, (size_t)(received - written));
-            if (nw <= 0) break;
-            written += nw;
-        }
-        close(p_fds[1]);
-        waitpid(pid, NULL, 0);
-    }
-
-    free(script_content);
-    nm_log("EXEC OK: executed '%s' shell commands.", req.filename);
-}
-
 
 /* --- Handler: CMD_CREATE -------------------------------------------------- */
 static void handle_create(int fd, int32_t cmd_type,
@@ -787,12 +622,6 @@ static void *handle_connection(void *arg) {
             break;
         case CMD_REMACCESS:
             handle_remaccess(fd, cmd_type, peer_ip);
-            break;
-        case CMD_CHECK_PERMISSION:
-            handle_check_permission(fd, cmd_type, peer_ip);
-            break;
-        case CMD_EXEC:
-            handle_exec(fd, cmd_type, peer_ip);
             break;
         default:
             nm_log("Unknown command %d from %s — ignored.", cmd_type, peer_ip);
