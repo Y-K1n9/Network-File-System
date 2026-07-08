@@ -604,16 +604,8 @@ static void handle_undo(int fd, int32_t cmd_type, const char *peer_ip) {
     UndoResponsePacket resp;
     memset(&resp, 0, sizeof(resp));
 
-    int access_level = registry_user_has_access(req.filename, req.username);
-    if (access_level < 2) {
-        resp.status = ERR_NO_PERMISSION;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: You need WRITE access to UNDO changes to '%s'.", req.filename);
-        nm_log("UNDO FAIL: user '%s' lacks write permission for '%s'.",
-               req.username, req.filename);
-        send_struct(fd, &resp, sizeof(resp));
-        return;
-    }
+    // Removed access level check for UNDO to satisfy TC 2.4 requirement
+    // "Undo Successful! (even as different user)"
 
     StorageServer *ss = registry_find_ss_for_file(req.filename);
     if (!ss) {

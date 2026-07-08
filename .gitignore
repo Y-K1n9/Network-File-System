@@ -24,3 +24,8 @@ client.c
 .DS_Store
 *.swp
 *~
+
+## Test and log files
+*.log
+*.pdf
+test_runner.sh
