@@ -3,7 +3,7 @@
 A distributed file system built with C, POSIX sockets, and pthreads.  
 Implements a **Naming Server (NM) + Storage Server (SS) + Client** architecture.
 
-> **This branch adds Feature 1 (CREATE), Feature 2 (INFO), Feature 4 (VIEW), UNDO, and EXEC.**
+> **This branch completes the robust NFS Concurrency requirements:** Sentence Level Locking, Concurrent Reads/Writes, and Full Word-Level WRITE implementations, alongside UNDO and EXEC.
 
 ---
 
@@ -191,8 +191,8 @@ bob@docs++ > DELETE report.txt
 
 - **Interactive Editing Session**: Users can update the content of a file at the word level. Initiating a write opens a direct connection to the hosting Storage Server.
 - **In-Memory Word/Sentence Tokenization**: The Storage Server splits the file content into dynamic sentences and words using `.`, `!`, and `?` as sentence delimiters.
-- **Dynamic Array Manipulation**: Insertions are handled using dynamic array shifts and splits. If an inserted word contains a delimiter, the sentence is split automatically.
-- **Commit on ETIRW**: Typing `ETIRW` finishes the write session, saves the file back to disk on the Storage Server, recalculates word count, character count, and file size, and pushes these statistics to the Naming Server.
+- **Sentence-Level Locking**: Concurrent writers can edit the exact same file simultaneously! The server uses an isolated `pthread_mutex_t` for every sentence node in memory, completely eliminating index-shifting data corruption.
+- **Commit on ETIRW & Lock Release**: Typing `ETIRW` finishes the write session, seamlessly splices the new memory nodes, writes the file to disk, calculates statistics for the Naming Server, and atomically destroys the lock so other users can edit.
 
 ### Expected Output
 
@@ -348,4 +348,10 @@ Command IDs defined in `common/protocols.h`.
 ### 2026-07-05
 - **Access Control (`ADDACCESS`, `REMACCESS`)**: Added the ability for file owners to dynamically grant Read (`-R`), Read/Write (`-W`), or completely revoke access for other users. Integrated Access Control Lists (ACL) into the Naming Server registry.
 - **INFO Command Implementation**: Finished the missing implementation of `INFO` in the client CLI to display rich file metadata, including timestamps, sizes, and the current user's access level.
+
+### 2026-07-07
+- **Distributed Concurrency & Sentence Locking**: Completely overhauled the Storage Server's file handling architecture. Migrated from raw buffer manipulation to a dynamic, in-memory `LiveFile` Linked List containing `SentenceNode` objects.
+- **Lock Management**: Implemented granular `pthread_mutex_t` locks at the sentence level, allowing multiple clients to edit different sentences within the same file simultaneously without the "Index Shifting" problem.
+- **Full WRITE/ETIRW Completion**: Clients now successfully pass `sentence_number` and `word_index` across the network, which the backend safely splices into memory nodes and commits to disk atomically on `ETIRW`, gracefully releasing locks.
+- **UNDO Integration**: Bridged the newly merged remote `UNDO` feature with the local `LiveFile` caching system to ensure file restorations properly clear memory and re-sync across concurrent sessions.
 ```
