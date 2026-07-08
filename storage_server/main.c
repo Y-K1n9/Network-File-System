@@ -211,75 +211,17 @@ static void handle_ss_delete(int fd, int32_t cmd_type) {
     send_struct(fd, &ack, sizeof(ack));
 }
 
-/* --- Handler: CMD_SS_UNDO ------------------------------------------------- */
-static void handle_ss_undo(int fd, int32_t cmd_type) {
-    SSUndoPacket req;
-    req.command_type = cmd_type;
-    if (recv_struct(fd,
-                    ((char *)&req) + sizeof(int32_t),
-                    sizeof(req)    - sizeof(int32_t)) != 0) {
-        ss_log("Failed to receive SSUndoPacket.");
-        return;
-    }
-
-    ss_log("UNDO request: file='%s'", req.filename);
-
-    SSUndoAck ack;
-    memset(&ack, 0, sizeof(ack));
-
-    if (contains_path_traversal(req.filename)) {
-        ack.status = ERR_INTERNAL;
-        snprintf(ack.message, sizeof(ack.message),
-                 "ERROR: Invalid filename '%s'.", req.filename);
-        send_struct(fd, &ack, sizeof(ack));
-        return;
-    }
-
-    char path[MAX_PATH_LEN + MAX_FILENAME + 2];
-    snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
-
-    char bak_path[MAX_PATH_LEN + MAX_FILENAME + 6];
-    snprintf(bak_path, sizeof(bak_path), "%s.bak", path);
-
-    if (rename(bak_path, path) != 0) {
-        ack.status = ERR_FILE_NOT_FOUND;
-        snprintf(ack.message, sizeof(ack.message),
-                 "No backup available to undo for '%s'.", req.filename);
-        ss_log("UNDO failed: no backup found for '%s'.", req.filename);
-    } else {
-        int words = 0, chars = 0;
-        long bytes = 0;
-        count_file_stats(g_storage_dir, req.filename, &words, &chars, &bytes);
-
-        int nm_fd = connect_to_server(g_nm_ip, g_nm_port);
-        if (nm_fd >= 0) {
-            SSUpdateStatsPacket stats_pkt;
-            stats_pkt.command_type = CMD_SS_UPDATE_STATS;
-            strncpy(stats_pkt.filename, req.filename, MAX_FILENAME - 1);
-            stats_pkt.word_count = words;
-            stats_pkt.char_count = chars;
-            stats_pkt.size_bytes = bytes;
-            send_struct(nm_fd, &stats_pkt, sizeof(stats_pkt));
-            close(nm_fd);
-        }
-        
-        ack.status = ERR_OK;
-        snprintf(ack.message, sizeof(ack.message),
-                 "Reverted last change for '%s'.", req.filename);
-        ss_log("UNDO OK: '%s' restored from backup.", req.filename);
-    }
-    send_struct(fd, &ack, sizeof(ack));
-}
 
 /* ==========================================================================
  *  WRITE / ETIRW — word-level editing
  * ========================================================================== */
 
-#define MAX_SENTENCE_WORDS 256
-#define MAX_SENTENCES 512
+#define MAX_SENTENCE_WORDS 128
+#define MAX_WORD_LEN 64
+#define MAX_SENTENCES 256
 
 typedef struct {
-    char words[MAX_SENTENCE_WORDS][MAX_FILENAME];
+    char words[MAX_SENTENCE_WORDS][MAX_WORD_LEN];
     int  word_count;
     int  ends_with_delimiter;
 } Sentence;
@@ -306,7 +248,7 @@ static void parse_file_content(const char *text, FileContent *fc) {
         if (c == '\0') {
             if (curr_word_len > 0) {
                 curr_word[curr_word_len] = '\0';
-                strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_FILENAME - 1);
+                strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_WORD_LEN - 1);
                 curr_s->word_count++;
                 curr_word_len = 0;
             }
@@ -319,7 +261,7 @@ static void parse_file_content(const char *text, FileContent *fc) {
         if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
             if (curr_word_len > 0) {
                 curr_word[curr_word_len] = '\0';
-                strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_FILENAME - 1);
+                strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_WORD_LEN - 1);
                 curr_s->word_count++;
                 curr_word_len = 0;
             }
@@ -327,7 +269,7 @@ static void parse_file_content(const char *text, FileContent *fc) {
             curr_word[curr_word_len++] = c;
             curr_word[curr_word_len] = '\0';
 
-            strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_FILENAME - 1);
+            strncpy(curr_s->words[curr_s->word_count], curr_word, MAX_WORD_LEN - 1);
             curr_s->word_count++;
             curr_s->ends_with_delimiter = 1;
             curr_word_len = 0;
@@ -338,38 +280,12 @@ static void parse_file_content(const char *text, FileContent *fc) {
             curr_s->word_count = 0;
             curr_s->ends_with_delimiter = 0;
         } else {
-            if (curr_word_len < 511) {
+            if (curr_word_len < MAX_WORD_LEN - 1) {
                 curr_word[curr_word_len++] = c;
             }
         }
     }
     fc->sentence_count = s_idx;
-}
-
-static void reconstruct_file_content(const FileContent *fc, char **out_buf, long *out_len) {
-    long capacity = 4096;
-    char *buf = malloc(capacity);
-    long len = 0;
-    buf[0] = '\0';
-
-    for (int i = 0; i < fc->sentence_count; i++) {
-        const Sentence *s = &fc->sentences[i];
-        for (int j = 0; j < s->word_count; j++) {
-            long word_len = strlen(s->words[j]);
-            while (len + word_len + 2 >= capacity) {
-                capacity *= 2;
-                buf = realloc(buf, capacity);
-            }
-            if (len > 0) {
-                buf[len++] = ' ';
-            }
-            memcpy(buf + len, s->words[j], word_len);
-            len += word_len;
-        }
-    }
-    buf[len] = '\0';
-    *out_buf = buf;
-    *out_len = len;
 }
 
 static int insert_content_at_index(FileContent *fc, int sentence_number, int word_index, const char *content) {
@@ -398,9 +314,9 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
         }
 
         memmove(&s->words[word_index + ins_words], &s->words[word_index],
-                (s->word_count - word_index) * MAX_FILENAME);
+                (s->word_count - word_index) * MAX_WORD_LEN);
         for (int i = 0; i < ins_words; i++) {
-            strncpy(s->words[word_index + i], temp_fc->sentences[0].words[i], MAX_FILENAME - 1);
+            strncpy(s->words[word_index + i], temp_fc->sentences[0].words[i], MAX_WORD_LEN - 1);
         }
         s->word_count += ins_words;
         free(temp_fc);
@@ -487,6 +403,218 @@ static int insert_content_at_index(FileContent *fc, int sentence_number, int wor
     }
 }
 
+/* --- Sentence Locking & LiveFile Tracking --- */
+typedef struct SentenceNode {
+    Sentence sentence;
+    pthread_mutex_t lock;
+    int locked_by_fd;
+    struct SentenceNode *next;
+} SentenceNode;
+
+typedef struct LiveFile {
+    char filename[MAX_FILENAME];
+    SentenceNode *head;
+    pthread_rwlock_t file_lock;
+    int active_writers;
+    struct LiveFile *next;
+} LiveFile;
+
+static pthread_mutex_t global_file_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+static LiveFile *global_file_table = NULL;
+
+static void evict_live_file(const char *filename) {
+    pthread_mutex_lock(&global_file_table_mutex);
+    LiveFile *curr = global_file_table;
+    LiveFile *prev = NULL;
+    while (curr) {
+        if (strcmp(curr->filename, filename) == 0) {
+            if (prev) prev->next = curr->next;
+            else global_file_table = curr->next;
+            
+            SentenceNode *n = curr->head;
+            while (n) {
+                SentenceNode *tmp = n;
+                n = n->next;
+                pthread_mutex_destroy(&tmp->lock);
+                free(tmp);
+            }
+            pthread_rwlock_destroy(&curr->file_lock);
+            free(curr);
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&global_file_table_mutex);
+}
+
+/* --- Handler: CMD_SS_UNDO ------------------------------------------------- */
+static void handle_ss_undo(int fd, int32_t cmd_type) {
+    SSUndoPacket req;
+    req.command_type = cmd_type;
+    if (recv_struct(fd,
+                    ((char *)&req) + sizeof(int32_t),
+                    sizeof(req)    - sizeof(int32_t)) != 0) {
+        ss_log("Failed to receive SSUndoPacket.");
+        return;
+    }
+
+    ss_log("UNDO request: file='%s'", req.filename);
+
+    SSUndoAck ack;
+    memset(&ack, 0, sizeof(ack));
+
+    if (contains_path_traversal(req.filename)) {
+        ack.status = ERR_INTERNAL;
+        snprintf(ack.message, sizeof(ack.message),
+                 "ERROR: Invalid filename '%s'.", req.filename);
+        send_struct(fd, &ack, sizeof(ack));
+        return;
+    }
+
+    char path[MAX_PATH_LEN + MAX_FILENAME + 2];
+    snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
+
+    char bak_path[MAX_PATH_LEN + MAX_FILENAME + 6];
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", path);
+
+    if (rename(bak_path, path) != 0) {
+        ack.status = ERR_FILE_NOT_FOUND;
+        snprintf(ack.message, sizeof(ack.message),
+                 "No backup available to undo for '%s'.", req.filename);
+        ss_log("UNDO failed: no backup found for '%s'.", req.filename);
+    } else {
+        // Evict from memory so next READ/WRITE loads the undone version
+        evict_live_file(req.filename);
+
+        int words = 0, chars = 0;
+        long bytes = 0;
+        count_file_stats(g_storage_dir, req.filename, &words, &chars, &bytes);
+
+        int nm_fd = connect_to_server(g_nm_ip, g_nm_port);
+        if (nm_fd >= 0) {
+            SSUpdateStatsPacket stats_pkt;
+            stats_pkt.command_type = CMD_SS_UPDATE_STATS;
+            strncpy(stats_pkt.filename, req.filename, MAX_FILENAME - 1);
+            stats_pkt.word_count = words;
+            stats_pkt.char_count = chars;
+            stats_pkt.size_bytes = bytes;
+            send_struct(nm_fd, &stats_pkt, sizeof(stats_pkt));
+            close(nm_fd);
+        }
+        
+        ack.status = ERR_OK;
+        snprintf(ack.message, sizeof(ack.message),
+                 "Reverted last change for '%s'.", req.filename);
+        ss_log("UNDO OK: '%s' restored from backup.", req.filename);
+    }
+    send_struct(fd, &ack, sizeof(ack));
+}
+
+
+static LiveFile* get_or_create_live_file(const char *filename) {
+    pthread_mutex_lock(&global_file_table_mutex);
+    LiveFile *curr = global_file_table;
+    while (curr) {
+        if (strcmp(curr->filename, filename) == 0) {
+            pthread_mutex_unlock(&global_file_table_mutex);
+            return curr;
+        }
+        curr = curr->next;
+    }
+    
+    LiveFile *lf = malloc(sizeof(LiveFile));
+    strncpy(lf->filename, filename, MAX_FILENAME - 1);
+    pthread_rwlock_init(&lf->file_lock, NULL);
+    lf->active_writers = 0;
+    lf->head = NULL;
+    
+    char *buffer = NULL;
+    long length = 0;
+    if (read_file_into_buffer(g_storage_dir, filename, &buffer, &length) >= 0) {
+        ss_log("DEBUG: read_file_into_buffer succeeded, length=%ld", length);
+        FileContent *fc = malloc(sizeof(FileContent));
+        if (fc) {
+            ss_log("DEBUG: malloc FileContent succeeded");
+            parse_file_content(buffer, fc);
+            ss_log("DEBUG: parse_file_content succeeded, sentence_count=%d", fc->sentence_count);
+            free(buffer);
+            
+            SentenceNode *tail = NULL;
+            for (int i = 0; i < fc->sentence_count; i++) {
+                SentenceNode *node = malloc(sizeof(SentenceNode));
+                node->sentence = fc->sentences[i];
+                pthread_mutex_init(&node->lock, NULL);
+                node->locked_by_fd = -1;
+                node->next = NULL;
+                
+                if (!lf->head) lf->head = node;
+                else tail->next = node;
+                tail = node;
+            }
+            free(fc);
+        } else {
+            free(buffer);
+        }
+    }
+    
+    lf->next = global_file_table;
+    global_file_table = lf;
+    pthread_mutex_unlock(&global_file_table_mutex);
+    return lf;
+}
+
+static void flush_live_file_to_disk(LiveFile *lf, const char *filename) {
+    long capacity = 4096;
+    char *buf = malloc(capacity);
+    long len = 0;
+    buf[0] = '\0';
+    
+    SentenceNode *curr = lf->head;
+    while (curr) {
+        Sentence *s = &curr->sentence;
+        for (int j = 0; j < s->word_count; j++) {
+            long word_len = strlen(s->words[j]);
+            while (len + word_len + 2 >= capacity) {
+                capacity *= 2;
+                buf = realloc(buf, capacity);
+            }
+            if (len > 0) buf[len++] = ' ';
+            memcpy(buf + len, s->words[j], word_len);
+            len += word_len;
+        }
+        curr = curr->next;
+    }
+    buf[len] = '\0';
+    
+    char path[MAX_PATH_LEN + MAX_FILENAME + 2];
+    snprintf(path, sizeof(path), "%s/%s", g_storage_dir, filename);
+
+    // Create Backup
+    char bak_path[MAX_PATH_LEN + MAX_FILENAME + 6];
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", path);
+    FILE *f_old = fopen(path, "rb");
+    if (f_old) {
+        FILE *f_bak = fopen(bak_path, "wb");
+        if (f_bak) {
+            char tmp_buf[4096];
+            size_t bytes;
+            while ((bytes = fread(tmp_buf, 1, sizeof(tmp_buf), f_old)) > 0) {
+                fwrite(tmp_buf, 1, bytes, f_bak);
+            }
+            fclose(f_bak);
+        }
+        fclose(f_old);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (f) {
+        if (len > 0) fwrite(buf, 1, len, f);
+        fclose(f);
+    }
+    free(buf);
+}
+
 static void handle_write(int fd, int32_t cmd_type) {
     WriteStartPacket req;
     req.command_type = cmd_type;
@@ -509,10 +637,13 @@ static void handle_write(int fd, int32_t cmd_type) {
         send_struct(fd, &resp, sizeof(resp));
         return;
     }
-
-    char *buffer = NULL;
-    long length = 0;
-    if (read_file_into_buffer(g_storage_dir, req.filename, &buffer, &length) < 0) {
+    
+    ss_log("DEBUG: Path traversal check passed");
+    
+    // Check if file physically exists
+    char path[MAX_PATH_LEN + MAX_FILENAME + 2];
+    snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
+    if (access(path, F_OK) != 0) {
         resp.status = ERR_FILE_NOT_FOUND;
         snprintf(resp.message, sizeof(resp.message),
                  "ERROR: File '%s' not found.", req.filename);
@@ -520,58 +651,106 @@ static void handle_write(int fd, int32_t cmd_type) {
         return;
     }
 
-    FileContent *fc = malloc(sizeof(FileContent));
-    if (!fc) {
+    ss_log("DEBUG: File access check passed, calling get_or_create_live_file");
+    LiveFile *lf = get_or_create_live_file(req.filename);
+    ss_log("DEBUG: get_or_create_live_file returned %p", lf);
+    if (!lf) {
         resp.status = ERR_INTERNAL;
         snprintf(resp.message, sizeof(resp.message), "ERROR: Out of memory.");
         send_struct(fd, &resp, sizeof(resp));
-        free(buffer);
         return;
     }
-    parse_file_content(buffer, fc);
-    free(buffer);
 
-    int N = fc->sentence_count;
-    int valid = 0;
-    if (N == 0) {
-        if (req.sentence_number == 0) valid = 1;
-    } else {
-        int ends_with_del = fc->sentences[N - 1].ends_with_delimiter;
-        if (ends_with_del) {
-            if (req.sentence_number >= 0 && req.sentence_number <= N) valid = 1;
-        } else {
-            if (req.sentence_number >= 0 && req.sentence_number < N) valid = 1;
+    pthread_rwlock_rdlock(&lf->file_lock);
+    
+    SentenceNode *target_node = NULL;
+    int idx = 0;
+    SentenceNode *curr = lf->head;
+    SentenceNode *prev = NULL;
+    while (curr) {
+        if (idx == req.sentence_number) {
+            target_node = curr;
+            break;
         }
+        prev = curr;
+        curr = curr->next;
+        idx++;
+    }
+    
+    // Check if appending new sentence at the very end
+    if (!target_node && idx == req.sentence_number) {
+        pthread_rwlock_unlock(&lf->file_lock);
+        pthread_rwlock_wrlock(&lf->file_lock);
+        
+        // Re-evaluate list safely
+        idx = 0; curr = lf->head; prev = NULL;
+        while (curr) {
+            if (idx == req.sentence_number) { target_node = curr; break; }
+            prev = curr;
+            curr = curr->next;
+            idx++;
+        }
+        
+        if (!target_node && idx == req.sentence_number) {
+            target_node = malloc(sizeof(SentenceNode));
+            memset(&target_node->sentence, 0, sizeof(Sentence));
+            pthread_mutex_init(&target_node->lock, NULL);
+            target_node->locked_by_fd = -1;
+            target_node->next = NULL;
+            
+            if (prev) prev->next = target_node;
+            else lf->head = target_node;
+        }
+        // Keep lock temporarily for mutex trylock below, will downgrade conceptually
     }
 
-    if (!valid) {
+    if (!target_node) {
+        pthread_rwlock_unlock(&lf->file_lock);
         resp.status = ERR_OUT_OF_RANGE;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ERROR: Sentence index out of range.");
+        snprintf(resp.message, sizeof(resp.message), "ERROR: Sentence index out of range.");
         send_struct(fd, &resp, sizeof(resp));
-        free(fc);
         return;
     }
 
-    if (req.sentence_number == N) {
-        if (N >= MAX_SENTENCES) {
-            resp.status = ERR_INTERNAL;
-            snprintf(resp.message, sizeof(resp.message),
-                     "ERROR: Max sentences reached.");
-            send_struct(fd, &resp, sizeof(resp));
-            free(fc);
-            return;
-        }
-        memset(&fc->sentences[N], 0, sizeof(Sentence));
-        fc->sentence_count++;
+    if (pthread_mutex_trylock(&target_node->lock) != 0) {
+        pthread_rwlock_unlock(&lf->file_lock);
+        resp.status = ERR_FILE_LOCKED;
+        snprintf(resp.message, sizeof(resp.message), "ERROR: Sentence %d is locked for editing.", req.sentence_number);
+        send_struct(fd, &resp, sizeof(resp));
+        return;
     }
+    
+    target_node->locked_by_fd = fd;
+    __atomic_fetch_add(&lf->active_writers, 1, __ATOMIC_SEQ_CST);
+    
+    pthread_rwlock_unlock(&lf->file_lock);
+
+    ss_log("DEBUG: Lock acquired on target_node %p", target_node);
 
     resp.status = ERR_OK;
     snprintf(resp.message, sizeof(resp.message), "OK");
     if (send_struct(fd, &resp, sizeof(resp)) < 0) {
-        free(fc);
+        target_node->locked_by_fd = -1;
+        pthread_mutex_unlock(&target_node->lock);
+        __atomic_fetch_sub(&lf->active_writers, 1, __ATOMIC_SEQ_CST);
         return;
     }
+    
+    FileContent *local_fc = malloc(sizeof(FileContent));
+    if (!local_fc) {
+        resp.status = ERR_INTERNAL;
+        snprintf(resp.message, sizeof(resp.message), "ERROR: Out of memory.");
+        send_struct(fd, &resp, sizeof(resp));
+        target_node->locked_by_fd = -1;
+        pthread_mutex_unlock(&target_node->lock);
+        __atomic_fetch_sub(&lf->active_writers, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+    memset(local_fc, 0, sizeof(FileContent));
+    local_fc->sentences[0] = target_node->sentence;
+    local_fc->sentence_count = 1;
+
+    int disconnected = 1;
 
     while (1) {
         WriteUpdatePacket update;
@@ -582,46 +761,46 @@ static void handle_write(int fd, int32_t cmd_type) {
 
         if (update.word_index == -1) {
             /* ETIRW — commit */
-            char *new_content = NULL;
-            long new_len = 0;
-            reconstruct_file_content(fc, &new_content, &new_len);
-
-            char path[MAX_PATH_LEN + MAX_FILENAME + 2];
-            snprintf(path, sizeof(path), "%s/%s", g_storage_dir, req.filename);
+            disconnected = 0;
+            pthread_rwlock_wrlock(&lf->file_lock);
             
-            char bak_path[MAX_PATH_LEN + MAX_FILENAME + 6];
-            snprintf(bak_path, sizeof(bak_path), "%s.bak", path);
+            SentenceNode *new_head = NULL;
+            SentenceNode *new_tail = NULL;
+            for (int i = 0; i < local_fc->sentence_count; i++) {
+                SentenceNode *n = malloc(sizeof(SentenceNode));
+                n->sentence = local_fc->sentences[i];
+                pthread_mutex_init(&n->lock, NULL);
+                n->locked_by_fd = -1;
+                n->next = NULL;
+                
+                if (!new_head) new_head = n;
+                else new_tail->next = n;
+                new_tail = n;
+            }
             
-            /* Backup existing file */
-            FILE *f_old = fopen(path, "rb");
-            if (f_old) {
-                FILE *f_bak = fopen(bak_path, "wb");
-                if (f_bak) {
-                    char tmp_buf[4096];
-                    size_t bytes;
-                    while ((bytes = fread(tmp_buf, 1, sizeof(tmp_buf), f_old)) > 0) {
-                        fwrite(tmp_buf, 1, bytes, f_bak);
-                    }
-                    fclose(f_bak);
-                }
-                fclose(f_old);
+            curr = lf->head;
+            prev = NULL;
+            while (curr && curr != target_node) {
+                prev = curr;
+                curr = curr->next;
             }
-
-            FILE *f = fopen(path, "w");
-            if (!f) {
-                WriteUpdateResponse upd_resp;
-                upd_resp.status = ERR_INTERNAL;
-                snprintf(upd_resp.message, sizeof(upd_resp.message),
-                         "ERROR: Failed to save file.");
-                send_struct(fd, &upd_resp, sizeof(upd_resp));
-                free(new_content);
-                break;
+            
+            if (curr == target_node) {
+                if (prev) prev->next = new_head;
+                else lf->head = new_head;
+                
+                if (new_tail) new_tail->next = target_node->next;
+                
+                target_node->locked_by_fd = -1;
+                pthread_mutex_unlock(&target_node->lock);
+                pthread_mutex_destroy(&target_node->lock);
+                free(target_node);
             }
-            if (new_len > 0) {
-                fwrite(new_content, 1, new_len, f);
-            }
-            fclose(f);
-            free(new_content);
+            
+            flush_live_file_to_disk(lf, req.filename);
+            
+            pthread_rwlock_unlock(&lf->file_lock);
+            __atomic_fetch_sub(&lf->active_writers, 1, __ATOMIC_SEQ_CST);
 
             int words = 0, chars = 0;
             long bytes = 0;
@@ -637,10 +816,6 @@ static void handle_write(int fd, int32_t cmd_type) {
                 stats_pkt.size_bytes = bytes;
                 send_struct(nm_fd, &stats_pkt, sizeof(stats_pkt));
                 close(nm_fd);
-                ss_log("Sent updated stats for '%s' to NM: words=%d chars=%d bytes=%ld",
-                       req.filename, words, chars, bytes);
-            } else {
-                ss_log("Warning: could not connect to NM to update stats.");
             }
 
             WriteUpdateResponse upd_resp;
@@ -651,7 +826,7 @@ static void handle_write(int fd, int32_t cmd_type) {
         } else {
             /* Word insertion */
             int word_idx = update.word_index;
-            Sentence *s = &fc->sentences[req.sentence_number];
+            Sentence *s = &local_fc->sentences[0]; // Edits apply to the initial part before any new delimiters
             int W = s->word_count;
 
             if (W == 0 && word_idx == 1) {
@@ -664,27 +839,32 @@ static void handle_write(int fd, int32_t cmd_type) {
                 snprintf(upd_resp.message, sizeof(upd_resp.message),
                          "ERROR: Word index out of range.");
                 send_struct(fd, &upd_resp, sizeof(upd_resp));
-                break;
+                continue;
             }
 
-            if (insert_content_at_index(fc, req.sentence_number, word_idx, update.content) < 0) {
+            if (insert_content_at_index(local_fc, 0, word_idx, update.content) < 0) {
                 WriteUpdateResponse upd_resp;
                 upd_resp.status = ERR_INTERNAL;
                 snprintf(upd_resp.message, sizeof(upd_resp.message),
                          "ERROR: Internal limit exceeded during insert.");
                 send_struct(fd, &upd_resp, sizeof(upd_resp));
-                break;
+                continue;
             }
 
             WriteUpdateResponse upd_resp;
             upd_resp.status = ERR_OK;
             snprintf(upd_resp.message, sizeof(upd_resp.message), "OK");
-            if (send_struct(fd, &upd_resp, sizeof(upd_resp)) < 0) {
-                break;
-            }
+            send_struct(fd, &upd_resp, sizeof(upd_resp));
         }
     }
-    free(fc);
+    
+    if (disconnected) {
+        target_node->locked_by_fd = -1;
+        pthread_mutex_unlock(&target_node->lock);
+        __atomic_fetch_sub(&lf->active_writers, 1, __ATOMIC_SEQ_CST);
+        ss_log("Client disconnected mid-WRITE, lock released without changes.");
+    }
+    free(local_fc);
 }
 
 /* --- Per-connection thread ------------------------------------------------ */
